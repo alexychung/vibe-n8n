@@ -1,0 +1,537 @@
+{
+  "workflow_name": "Daily NYC Weather Summary with Freezing Alert",
+  "description": "Fetches daily weather data for New York City from Open-Meteo each morning, highlights freezing temperatures prominently, and delivers a formatted summary via webhook output. Email delivery is out of scope for this implementation; the downstream webhook endpoint is responsible for any email conversion.",
+  "trigger": {
+    "type": "cron",
+    "description": "Runs every morning at 7:00 AM New York time (America/New_York). n8n server MUST have GENERIC_TIMEZONE=America/New_York set, OR the cron expression must be adjusted to UTC equivalent. The cron expression '0 7 * * *' is interpreted in the server's system timezone."
+  },
+  "steps": [
+    {
+      "id": "step_1",
+      "name": "Schedule Daily Morning Trigger",
+      "node_type": "n8n-nodes-base.scheduleTrigger",
+      "determinism": "1.0",
+      "description": "Triggers the workflow every day at 7:00 AM. IMPORTANT: n8n interprets cron expressions in the server's system timezone. Set the n8n environment variable GENERIC_TIMEZONE=America/New_York to ensure this fires at 7:00 AM New York time. If the server runs in UTC, '0 7 * * *' fires at 7:00 AM UTC (2\u20133 AM New York time).",
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "timestamp": "ISO datetime of trigger"
+      },
+      "error_handling": "No action needed; cron triggers are managed by n8n scheduler."
+    },
+    {
+      "id": "step_2",
+      "name": "Fetch NYC Weather from Open-Meteo",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Calls the Open-Meteo API to get current weather data for New York City including temperature (Fahrenheit), weather code, wind speed, and daily min/max temperature plus precipitation sum for a complete morning briefing. Note: the 'daily' parameter is sent as a single comma-separated string value, which is what Open-Meteo expects. Verify in development that n8n does not double-encode the commas.",
+      "parameters": {
+        "url": "https://api.open-meteo.com/v1/forecast",
+        "method": "GET",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "latitude",
+              "value": "40.7128"
+            },
+            {
+              "name": "longitude",
+              "value": "-74.0060"
+            },
+            {
+              "name": "current_weather",
+              "value": "true"
+            },
+            {
+              "name": "daily",
+              "value": "temperature_2m_max,temperature_2m_min,precipitation_sum"
+            },
+            {
+              "name": "temperature_unit",
+              "value": "fahrenheit"
+            },
+            {
+              "name": "wind_speed_unit",
+              "value": "mph"
+            },
+            {
+              "name": "timezone",
+              "value": "America/New_York"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 2,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "current_weather": {
+          "temperature": "number (\u00b0F)",
+          "windspeed": "number (mph)",
+          "weathercode": "WMO weather code integer",
+          "time": "ISO datetime string"
+        },
+        "daily": {
+          "temperature_2m_max": "array of daily max temps (\u00b0F)",
+          "temperature_2m_min": "array of daily min temps (\u00b0F)",
+          "precipitation_sum": "array of daily precipitation totals (mm)"
+        },
+        "latitude": "40.7128",
+        "longitude": "-74.0060"
+      },
+      "error_handling": "Retry up to 2 times with 1s delay; if all retries fail, stop workflow and log error. Note: Open-Meteo may return HTTP 200 with error:true in the JSON body for application-level errors \u2014 these are caught in step_3."
+    },
+    {
+      "id": "step_3",
+      "name": "Parse, Normalize, and Build Weather Message",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Validates the API response shape (including Open-Meteo application-level errors), extracts current and daily weather fields with null guards, maps the WMO weather code to a human-readable condition string, computes a freezing flag, and builds the complete subject/body/alertLevel output in one step.",
+      "parameters": {
+        "jsCode": "const item = $input.first();\n\n// Guard: check for Open-Meteo application-level errors (HTTP 200 with error:true)\nif (item.json.error === true) {\n  throw new Error('Open-Meteo API error: ' + (item.json.reason || 'unknown reason') + ' | Full response: ' + JSON.stringify(item.json));\n}\n\n// Guard: validate API response shape\nif (!item.json.current_weather) {\n  throw new Error('API response missing current_weather: ' + JSON.stringify(item.json));\n}\n\nconst cw = item.json.current_weather;\nconst temp = cw.temperature;\nconst windspeed = cw.windspeed;\nconst code = cw.weathercode;\nconst time = cw.time;\n\n// Guard: validate all required current_weather fields are present and non-null\nif (temp == null || windspeed == null || code == null || !time) {\n  throw new Error('Incomplete current_weather fields: ' + JSON.stringify(cw));\n}\n\n// Guard: validate time format to catch unexpected API format changes\nif (!/^\\d{4}-\\d{2}-\\d{2}T/.test(time)) {\n  throw new Error('Unexpected time format from API: ' + time);\n}\n\n// Extract daily fields safely (first element of each array)\nconst daily = item.json.daily || {};\nconst tempMax = (daily.temperature_2m_max && daily.temperature_2m_max[0] != null) ? daily.temperature_2m_max[0] : null;\nconst tempMin = (daily.temperature_2m_min && daily.temperature_2m_min[0] != null) ? daily.temperature_2m_min[0] : null;\nconst precipSum = (daily.precipitation_sum && daily.precipitation_sum[0] != null) ? daily.precipitation_sum[0] : null;\n\nconst wmoMap = {\n  0: 'Clear sky',\n  1: 'Mainly clear', 2: 'Partly cloudy', 3: 'Overcast',\n  45: 'Fog', 48: 'Depositing rime fog',\n  51: 'Light drizzle', 53: 'Moderate drizzle', 55: 'Dense drizzle',\n  61: 'Slight rain', 63: 'Moderate rain', 65: 'Heavy rain',\n  71: 'Slight snow', 73: 'Moderate snow', 75: 'Heavy snow',\n  77: 'Snow grains',\n  80: 'Slight rain showers', 81: 'Moderate rain showers', 82: 'Violent rain showers',\n  85: 'Slight snow showers', 86: 'Heavy snow showers',\n  95: 'Thunderstorm', 96: 'Thunderstorm with slight hail', 99: 'Thunderstorm with heavy hail'\n};\n\nconst condition = wmoMap[code] || `Unknown (code ${code})`;\nconst isFreezing = temp <= 32;\n\n// Safely extract date string by slicing the naive datetime string directly\n// to avoid UTC misinterpretation by new Date() on a no-offset string\nconst datePart = time.substring(0, 10); // e.g. \"2024-03-15\"\nconst [year, month, day] = datePart.split('-').map(Number);\nconst monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];\nconst dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];\n// Use noon UTC of the extracted date to avoid any day-boundary rollover\nconst dateObj = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));\nconst weekday = dayNames[dateObj.getUTCDay()];\nconst dateStr = `${weekday}, ${monthNames[month - 1]} ${day}, ${year}`;\n\n// Build daily summary lines if available\nconst dailyLines = [];\nif (tempMax !== null) dailyLines.push(`\ud83d\udcc8  Today's High: ${tempMax}\u00b0F`);\nif (tempMin !== null) dailyLines.push(`\ud83d\udcc9  Today's Low: ${tempMin}\u00b0F`);\nif (precipSum !== null) dailyLines.push(`\ud83c\udf27\ufe0f  Precipitation: ${precipSum} mm`);\nconst dailySummary = dailyLines.length > 0 ? '\\n' + dailyLines.join('\\n') : '';\n\n// Build subject, body, alertLevel based on freezing flag\nlet subject, body, alertLevel;\n\nif (isFreezing) {\n  alertLevel = 'FREEZING';\n  subject = `\ud83d\udea8 FREEZING ALERT: NYC Weather for ${dateStr}`;\n  body = `\ud83d\udea8\ud83d\udea8\ud83d\udea8 FREEZING TEMPERATURE ALERT \ud83d\udea8\ud83d\udea8\ud83d\udea8\\n\\nDate: ${dateStr}\\n\\n\u2744\ufe0f  TEMPERATURE: ${temp}\u00b0F \u2014 BELOW OR AT FREEZING!\\n\ud83d\udca8  Wind Speed: ${windspeed} mph\\n\ud83c\udf25\ufe0f  Conditions: ${condition}${dailySummary}\\n\\n\u26a0\ufe0f  WARNING: Temperatures are at or below 32\u00b0F. Dress in layers, protect pipes, and exercise caution on icy surfaces.\\n\\nStay warm and safe!`;\n} else {\n  alertLevel = 'NORMAL';\n  subject = `\ud83c\udf24\ufe0f NYC Morning Weather for ${dateStr}`;\n  body = `Good morning! Here's your NYC weather summary for ${dateStr}:\\n\\n\ud83c\udf21\ufe0f  Temperature: ${temp}\u00b0F\\n\ud83d\udca8  Wind Speed: ${windspeed} mph\\n\ud83c\udf25\ufe0f  Conditions: ${condition}${dailySummary}\\n\\nHave a great day!`;\n}\n\nreturn [{\n  json: {\n    temperature: temp,\n    windspeed: windspeed,\n    weathercode: code,\n    condition: condition,\n    isFreezing: isFreezing,\n    dateStr: dateStr,\n    time: time,\n    tempMax: tempMax,\n    tempMin: tempMin,\n    precipSum: precipSum,\n    subject: subject,\n    body: body,\n    alertLevel: alertLevel\n  }\n}];"
+      },
+      "output_shape": {
+        "temperature": "number (\u00b0F)",
+        "windspeed": "number (mph)",
+        "weathercode": "integer",
+        "condition": "string (human-readable)",
+        "isFreezing": "boolean",
+        "dateStr": "formatted date string",
+        "time": "ISO datetime string",
+        "tempMax": "number or null \u2014 daily high (\u00b0F)",
+        "tempMin": "number or null \u2014 daily low (\u00b0F)",
+        "precipSum": "number or null \u2014 daily precipitation (mm)",
+        "subject": "string \u2014 email/webhook subject line",
+        "body": "string \u2014 formatted message body",
+        "alertLevel": "string \u2014 FREEZING or NORMAL"
+      },
+      "error_handling": "Throws a descriptive error if: Open-Meteo returns error:true, current_weather is missing, any required current_weather field is null/undefined, or the time field has an unexpected format. If any parsing fails, stop workflow and log the raw API response for debugging."
+    },
+    {
+      "id": "step_4",
+      "name": "Validate Webhook URL Configuration",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Pre-flight check that validates WEATHER_WEBHOOK_URL is configured, non-empty, and appears to be a valid URL before attempting delivery. Throws a descriptive error early if misconfigured, preventing an opaque failure in the HTTP Request node.",
+      "parameters": {
+        "jsCode": "const webhookUrl = $env.WEATHER_WEBHOOK_URL;\n\nif (!webhookUrl || webhookUrl.trim() === '') {\n  throw new Error('Configuration error: WEATHER_WEBHOOK_URL environment variable is not set or is empty. Please configure this variable before running the workflow.');\n}\n\nif (!/^https?:\\/\\/.+/.test(webhookUrl.trim())) {\n  throw new Error('Configuration error: WEATHER_WEBHOOK_URL does not appear to be a valid URL: ' + webhookUrl);\n}\n\n// Pass through all input data unchanged\nreturn $input.all();"
+      },
+      "output_shape": {
+        "passthrough": "All fields from step_3 are passed through unchanged"
+      },
+      "error_handling": "Throws a descriptive configuration error if WEATHER_WEBHOOK_URL is missing or malformed. Workflow stops immediately with a clear message."
+    },
+    {
+      "id": "step_5",
+      "name": "Send Weather Summary via Webhook POST",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Delivers the formatted weather summary (freezing alert or normal) to a downstream webhook endpoint (e.g., Slack, email relay, or notification service). URL must be configured via environment variable WEATHER_WEBHOOK_URL before deployment. Bearer token must be configured via environment variable WEATHER_WEBHOOK_TOKEN. Email delivery is out of scope; the downstream webhook service handles any email conversion.",
+      "parameters": {
+        "url": "={{ $env.WEATHER_WEBHOOK_URL }}",
+        "method": "POST",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "body": {
+          "subject": "={{ $json.subject }}",
+          "body": "={{ $json.body }}",
+          "alertLevel": "={{ $json.alertLevel }}",
+          "temperature": "={{ $json.temperature }}",
+          "condition": "={{ $json.condition }}",
+          "windspeed": "={{ $json.windspeed }}",
+          "dateStr": "={{ $json.dateStr }}",
+          "tempMax": "={{ $json.tempMax }}",
+          "tempMin": "={{ $json.tempMin }}",
+          "precipSum": "={{ $json.precipSum }}"
+        },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.WEATHER_WEBHOOK_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 2,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "status": "HTTP response status",
+        "response": "Webhook acknowledgment"
+      },
+      "error_handling": "Retry up to 2 times with 1s delay; if all retries fail, log the failure with the message payload for manual review. A global error workflow should fire to notify the operator of delivery failure."
+    }
+  ],
+  "gates": [],
+  "connections": [
+    {
+      "from": "step_1",
+      "to": "step_2"
+    },
+    {
+      "from": "step_2",
+      "to": "step_3"
+    },
+    {
+      "from": "step_3",
+      "to": "step_4"
+    },
+    {
+      "from": "step_4",
+      "to": "step_5"
+    }
+  ],
+  "error_handling": {
+    "global_timeout_seconds": 120,
+    "on_workflow_failure": "Log error details including step ID, timestamp, and error message. Trigger n8n error workflow to send a fallback operator alert if the weather fetch or delivery fails."
+  },
+  "output": {
+    "destination": "Webhook POST to downstream notification endpoint configured via WEATHER_WEBHOOK_URL environment variable (configurable: Slack, email relay, PagerDuty, etc.). Email delivery is out of scope for this workflow \u2014 the downstream webhook service is responsible for any email conversion.",
+    "format": "JSON payload with subject, body (plain text formatted), alertLevel, temperature, condition, windspeed, dateStr, tempMax, tempMin, precipSum",
+    "description": "A human-readable daily weather summary for NYC, with freezing days flagged prominently via subject line emoji, alert level field, and warning body text. Includes daily high/low and precipitation for a complete morning briefing."
+  },
+  "security": {
+    "credentials_needed": [
+      "WEATHER_WEBHOOK_URL \u2014 webhook delivery endpoint URL, stored as n8n environment variable; MUST be set before deployment",
+      "WEATHER_WEBHOOK_TOKEN \u2014 Bearer token for Authorization header on outbound webhook POST, stored as n8n environment variable (referenced via $env.WEATHER_WEBHOOK_TOKEN). Note: n8n's $credential.* syntax is NOT valid for expression fields; environment variables are used instead.",
+      "No API key required for Open-Meteo (free, public API)"
+    ],
+    "pii_handling": "No PII is collected or transmitted. Weather data is public.",
+    "data_flow": "Open-Meteo API \u2192 n8n (in-memory processing) \u2192 Downstream webhook. No data is persisted.",
+    "outbound_auth": "All webhook POSTs include an Authorization: Bearer header using the WEATHER_WEBHOOK_TOKEN environment variable to prevent spoofing.",
+    "timezone_dependency": "The cron trigger relies on the n8n server timezone. Set GENERIC_TIMEZONE=America/New_York on the n8n server to ensure 7:00 AM New York local time firing. If the server runs in UTC, the cron expression must be adjusted (e.g., '0 12 * * *' for UTC noon = 7 AM ET winter / 8 AM ET summer \u2014 DST must be accounted for manually if not using GENERIC_TIMEZONE)."
+  },
+  "cost_estimate": {
+    "per_run": "$0.00",
+    "notes": "Open-Meteo is free with no rate limits for reasonable usage. n8n self-hosted has no per-execution cost. Downstream webhook cost depends on provider (e.g., Slack free tier is sufficient)."
+  },
+  "test_cases": [
+    {
+      "name": "Happy path \u2013 normal temperature (above freezing)",
+      "input": {
+        "simulated_api_response": {
+          "current_weather": {
+            "temperature": 55.4,
+            "windspeed": 12.3,
+            "weathercode": 2,
+            "time": "2024-03-15T07:00"
+          },
+          "daily": {
+            "temperature_2m_max": [
+              60.1
+            ],
+            "temperature_2m_min": [
+              48.3
+            ],
+            "precipitation_sum": [
+              0.0
+            ]
+          }
+        }
+      },
+      "expected": {
+        "alertLevel": "NORMAL",
+        "subject_contains": "\ud83c\udf24\ufe0f NYC Morning Weather",
+        "body_contains": "55.4\u00b0F",
+        "body_contains_condition": "Partly cloudy",
+        "body_contains_wind": "12.3 mph",
+        "body_contains_high": "60.1\u00b0F",
+        "body_contains_low": "48.3\u00b0F",
+        "isFreezing": false,
+        "webhook_called": true
+      }
+    },
+    {
+      "name": "Freezing alert path \u2013 temperature exactly at 32\u00b0F",
+      "input": {
+        "simulated_api_response": {
+          "current_weather": {
+            "temperature": 32.0,
+            "windspeed": 8.5,
+            "weathercode": 71,
+            "time": "2024-01-10T07:00"
+          },
+          "daily": {
+            "temperature_2m_max": [
+              34.0
+            ],
+            "temperature_2m_min": [
+              28.0
+            ],
+            "precipitation_sum": [
+              2.5
+            ]
+          }
+        }
+      },
+      "expected": {
+        "alertLevel": "FREEZING",
+        "subject_contains": "\ud83d\udea8 FREEZING ALERT",
+        "body_contains": "32\u00b0F",
+        "body_contains_condition": "Slight snow",
+        "body_contains_warning": "BELOW OR AT FREEZING",
+        "isFreezing": true,
+        "webhook_called": true
+      }
+    },
+    {
+      "name": "Well below freezing \u2013 extreme cold",
+      "input": {
+        "simulated_api_response": {
+          "current_weather": {
+            "temperature": 12.0,
+            "windspeed": 22.0,
+            "weathercode": 75,
+            "time": "2024-01-20T07:00"
+          },
+          "daily": {
+            "temperature_2m_max": [
+              18.0
+            ],
+            "temperature_2m_min": [
+              8.0
+            ],
+            "precipitation_sum": [
+              5.1
+            ]
+          }
+        }
+      },
+      "expected": {
+        "alertLevel": "FREEZING",
+        "subject_contains": "\ud83d\udea8 FREEZING ALERT",
+        "body_contains": "12\u00b0F",
+        "body_contains_condition": "Heavy snow",
+        "body_contains_wind": "22 mph",
+        "isFreezing": true,
+        "webhook_called": true
+      }
+    },
+    {
+      "name": "API failure \u2013 Open-Meteo unreachable",
+      "input": {
+        "simulated_error": "Connection timeout after 2 retries"
+      },
+      "expected": {
+        "workflow_stops": true,
+        "error_logged": true,
+        "no_webhook_delivered": true,
+        "error_message_contains": "any non-empty string"
+      }
+    },
+    {
+      "name": "Unknown weather code edge case",
+      "input": {
+        "simulated_api_response": {
+          "current_weather": {
+            "temperature": 68.0,
+            "windspeed": 5.0,
+            "weathercode": 999,
+            "time": "2024-06-01T07:00"
+          },
+          "daily": {
+            "temperature_2m_max": [
+              72.0
+            ],
+            "temperature_2m_min": [
+              61.0
+            ],
+            "precipitation_sum": [
+              0.0
+            ]
+          }
+        }
+      },
+      "expected": {
+        "alertLevel": "NORMAL",
+        "condition_contains": "Unknown (code 999)",
+        "body_contains": "68\u00b0F",
+        "isFreezing": false,
+        "webhook_called": true
+      }
+    },
+    {
+      "name": "Malformed API response \u2013 missing current_weather field",
+      "input": {
+        "simulated_api_response": {
+          "reason": "Parameter latitude is out of range"
+        }
+      },
+      "expected": {
+        "workflow_stops": true,
+        "error_logged": true,
+        "error_message_contains": "API response missing current_weather",
+        "no_webhook_delivered": true
+      }
+    },
+    {
+      "name": "Daily fields absent \u2013 graceful degradation",
+      "input": {
+        "simulated_api_response": {
+          "current_weather": {
+            "temperature": 45.0,
+            "windspeed": 9.0,
+            "weathercode": 3,
+            "time": "2024-04-10T07:00"
+          }
+        }
+      },
+      "expected": {
+        "alertLevel": "NORMAL",
+        "body_contains": "45\u00b0F",
+        "body_contains_condition": "Overcast",
+        "tempMax": null,
+        "tempMin": null,
+        "precipSum": null,
+        "webhook_called": true
+      }
+    },
+    {
+      "name": "Webhook delivery failure \u2013 endpoint unreachable",
+      "input": {
+        "simulated_api_response": {
+          "current_weather": {
+            "temperature": 50.0,
+            "windspeed": 7.0,
+            "weathercode": 1,
+            "time": "2024-05-01T07:00"
+          },
+          "daily": {
+            "temperature_2m_max": [
+              55.0
+            ],
+            "temperature_2m_min": [
+              44.0
+            ],
+            "precipitation_sum": [
+              0.0
+            ]
+          }
+        },
+        "simulated_webhook_error": "Connection refused after 2 retries"
+      },
+      "expected": {
+        "workflow_stops": true,
+        "error_logged": true,
+        "error_message_contains": "any non-empty string",
+        "operator_notified_via_error_workflow": true
+      }
+    },
+    {
+      "name": "Open-Meteo application-level error \u2013 HTTP 200 with error:true",
+      "input": {
+        "simulated_api_response": {
+          "error": true,
+          "reason": "Cannot initialize WeatherVariable from invalid String value temperature_2m_INVALID for VariableWithoutUnit"
+        }
+      },
+      "expected": {
+        "workflow_stops": true,
+        "error_logged": true,
+        "error_message_contains": "Open-Meteo API error",
+        "no_webhook_delivered": true
+      }
+    },
+    {
+      "name": "Incomplete current_weather fields \u2013 null temperature",
+      "input": {
+        "simulated_api_response": {
+          "current_weather": {
+            "temperature": null,
+            "windspeed": 10.0,
+            "weathercode": 1,
+            "time": "2024-05-01T07:00"
+          }
+        }
+      },
+      "expected": {
+        "workflow_stops": true,
+        "error_logged": true,
+        "error_message_contains": "Incomplete current_weather fields",
+        "no_webhook_delivered": true
+      }
+    },
+    {
+      "name": "Unexpected time format from API",
+      "input": {
+        "simulated_api_response": {
+          "current_weather": {
+            "temperature": 55.0,
+            "windspeed": 10.0,
+            "weathercode": 1,
+            "time": "2024-05-01T07:00:00Z"
+          }
+        }
+      },
+      "expected": {
+        "notes": "The regex /^\\d{4}-\\d{2}-\\d{2}T/ will still match this format so it passes. This test confirms the guard does not over-reject valid ISO variants that begin with the expected date prefix. If a radically different format were returned (e.g., Unix timestamp), it would throw.",
+        "alertLevel": "NORMAL",
+        "body_contains": "55\u00b0F",
+        "webhook_called": true
+      }
+    },
+    {
+      "name": "WEATHER_WEBHOOK_URL not configured \u2013 pre-flight validation catch",
+      "input": {
+        "simulated_env": {
+          "WEATHER_WEBHOOK_URL": ""
+        },
+        "simulated_api_response": {
+          "current_weather": {
+            "temperature": 60.0,
+            "windspeed": 8.0,
+            "weathercode": 0,
+            "time": "2024-06-15T07:00"
+          }
+        }
+      },
+      "expected": {
+        "workflow_stops_at_step": "step_4",
+        "error_logged": true,
+        "error_message_contains": "WEATHER_WEBHOOK_URL environment variable is not set",
+        "no_webhook_delivered": true
+      }
+    },
+    {
+      "name": "WEATHER_WEBHOOK_URL malformed \u2013 pre-flight validation catch",
+      "input": {
+        "simulated_env": {
+          "WEATHER_WEBHOOK_URL": "not-a-valid-url"
+        },
+        "simulated_api_response": {
+          "current_weather": {
+            "temperature": 60.0,
+            "windspeed": 8.0,
+            "weathercode": 0,
+            "time": "2024-06-15T07:00"
+          }
+        }
+      },
+      "expected": {
+        "workflow_stops_at_step": "step_4",
+        "error_logged": true,
+        "error_message_contains": "does not appear to be a valid URL",
+        "no_webhook_delivered": true
+      }
+    }
+  ],
+  "components_used": [],
+  "components_needed": []
+}

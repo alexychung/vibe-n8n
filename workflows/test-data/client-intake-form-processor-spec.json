@@ -1,0 +1,524 @@
+{
+  "workflow_name": "Client Intake Form Processor",
+  "description": "Processes Typeform client intake submissions by creating or updating client records in the CRM and notifying the team via Slack.",
+  "trigger": {
+    "type": "webhook",
+    "path": "client-intake",
+    "method": "POST",
+    "description": "Receives client intake form submissions from Typeform via webhook"
+  },
+  "steps": [
+    {
+      "id": "step_1",
+      "name": "Extract and Normalize Form Fields",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Extracts and normalizes key fields from the Typeform webhook payload into a consistent structure",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "email",
+              "value": "={{ $json.body.form_response.answers.find(a => a.field.ref === 'email_field')?.email ?? $json.body.form_response.answers.find(a => a.type === 'email')?.email }}",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "full_name",
+              "value": "={{ $json.body.form_response.answers.find(a => a.field.ref === 'name_field')?.text ?? $json.body.form_response.answers.find(a => a.type === 'short_text')?.text }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "phone",
+              "value": "={{ $json.body.form_response.answers.find(a => a.field.ref === 'phone_field')?.phone_number ?? '' }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "company",
+              "value": "={{ $json.body.form_response.answers.find(a => a.field.ref === 'company_field')?.text ?? '' }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "submitted_at",
+              "value": "={{ $json.body.form_response.submitted_at }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "typeform_response_id",
+              "value": "={{ $json.body.event_id }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "email": "string",
+        "full_name": "string",
+        "phone": "string",
+        "company": "string",
+        "submitted_at": "string",
+        "typeform_response_id": "string"
+      },
+      "error_handling": "Halt workflow and log error if required fields cannot be extracted"
+    },
+    {
+      "id": "step_2",
+      "name": "Validate Required Fields Present",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Checks that email and full_name are present before proceeding",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch_true": "valid submission",
+        "branch_false": "invalid submission"
+      },
+      "error_handling": "Route to error notification if fields are missing"
+    },
+    {
+      "id": "step_3",
+      "name": "Look Up Existing Client by Email",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Queries the CRM API to check if a client with the submitted email already exists",
+      "parameters": {
+        "url": "={{ 'https://your-crm.example.com/api/clients?email=' + encodeURIComponent($json.email) }}",
+        "method": "GET",
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "clients": "array",
+        "total": "number"
+      },
+      "error_handling": "Retry up to 3 times; on persistent failure, halt and alert via Slack error channel"
+    },
+    {
+      "id": "step_4",
+      "name": "Check If Client Already Exists",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Branches based on whether an existing client record was found in the CRM",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch_true": "existing client found",
+        "branch_false": "new client"
+      },
+      "error_handling": "Default to new client creation if lookup result is ambiguous"
+    },
+    {
+      "id": "step_5",
+      "name": "Update Existing Client Record",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Updates the existing client record in the CRM with the latest intake form data",
+      "parameters": {
+        "url": "={{ 'https://your-crm.example.com/api/clients/' + $json.clients[0].id }}",
+        "method": "PATCH",
+        "body": {
+          "full_name": "={{ $('Extract and Normalize Form Fields').item.json.full_name }}",
+          "phone": "={{ $('Extract and Normalize Form Fields').item.json.phone }}",
+          "company": "={{ $('Extract and Normalize Form Fields').item.json.company }}",
+          "last_intake_at": "={{ $('Extract and Normalize Form Fields').item.json.submitted_at }}",
+          "typeform_response_id": "={{ $('Extract and Normalize Form Fields').item.json.typeform_response_id }}"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "id": "string",
+        "email": "string",
+        "full_name": "string",
+        "updated": true
+      },
+      "error_handling": "Retry up to 3 times; log error and halt if update fails"
+    },
+    {
+      "id": "step_6",
+      "name": "Create New Client Record",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Creates a new client record in the CRM with all intake form data",
+      "parameters": {
+        "url": "https://your-crm.example.com/api/clients",
+        "method": "POST",
+        "body": {
+          "email": "={{ $('Extract and Normalize Form Fields').item.json.email }}",
+          "full_name": "={{ $('Extract and Normalize Form Fields').item.json.full_name }}",
+          "phone": "={{ $('Extract and Normalize Form Fields').item.json.phone }}",
+          "company": "={{ $('Extract and Normalize Form Fields').item.json.company }}",
+          "intake_submitted_at": "={{ $('Extract and Normalize Form Fields').item.json.submitted_at }}",
+          "typeform_response_id": "={{ $('Extract and Normalize Form Fields').item.json.typeform_response_id }}",
+          "status": "new"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "id": "string",
+        "email": "string",
+        "full_name": "string",
+        "created": true
+      },
+      "error_handling": "Retry up to 3 times; log error and halt if creation fails"
+    },
+    {
+      "id": "step_7",
+      "name": "Build Slack Notification Message",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Constructs the Slack message payload with client details and action taken (created or updated)",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "slack_message",
+              "value": "={{ '\ud83c\udd95 *New Client Intake Received*\\n\\n*Name:* ' + $('Extract and Normalize Form Fields').item.json.full_name + '\\n*Email:* ' + $('Extract and Normalize Form Fields').item.json.email + '\\n*Company:* ' + ($('Extract and Normalize Form Fields').item.json.company || 'N/A') + '\\n*Phone:* ' + ($('Extract and Normalize Form Fields').item.json.phone || 'N/A') + '\\n*Submitted:* ' + $('Extract and Normalize Form Fields').item.json.submitted_at + '\\n*Action:* ' + ($json.updated ? 'Existing client updated' : 'New client created') + '\\n*CRM ID:* ' + $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "client_id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "action_taken",
+              "value": "={{ $json.updated ? 'updated' : 'created' }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "slack_message": "string",
+        "client_id": "string",
+        "action_taken": "string"
+      },
+      "error_handling": "Log error if message construction fails; do not block Slack send"
+    },
+    {
+      "id": "step_8",
+      "name": "Send Slack Team Notification",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Posts a notification to the team Slack channel with the new or updated client details",
+      "parameters": {
+        "url": "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK",
+        "method": "POST",
+        "body": {
+          "text": "={{ $json.slack_message }}",
+          "channel": "#new-clients",
+          "username": "ClientIntakeBot",
+          "icon_emoji": ":briefcase:"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "ok": true
+      },
+      "error_handling": "Retry up to 3 times; log failure but do not block workflow completion"
+    },
+    {
+      "id": "step_9",
+      "name": "Send Validation Failure Slack Alert",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Sends a Slack alert when a submission is missing required fields (email or name)",
+      "parameters": {
+        "url": "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK",
+        "method": "POST",
+        "body": {
+          "text": "={{ '\u26a0\ufe0f *Intake Form Submission Missing Required Fields*\\n\\nA Typeform submission was received but is missing email or name. Response ID: ' + $json.typeform_response_id + '\\nPlease review manually.' }}",
+          "channel": "#intake-errors",
+          "username": "ClientIntakeBot",
+          "icon_emoji": ":warning:"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "ok": true
+      },
+      "error_handling": "Retry up to 3 times; log if alert cannot be sent"
+    },
+    {
+      "id": "step_10",
+      "name": "Build Workflow Success Response",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Constructs the final HTTP response to return to Typeform webhook confirming successful processing",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "status",
+              "value": "success",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "message",
+              "value": "Client intake processed successfully",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "client_id",
+              "value": "={{ $('Build Slack Notification Message').item.json.client_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "action_taken",
+              "value": "={{ $('Build Slack Notification Message').item.json.action_taken }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "status": "success",
+        "message": "string",
+        "client_id": "string",
+        "action_taken": "string"
+      },
+      "error_handling": "Return generic success to avoid retries from Typeform"
+    }
+  ],
+  "gates": [
+    {
+      "after_step": "step_2",
+      "pass_to": "step_3",
+      "fail_to": "step_9",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_4",
+      "pass_to": "step_5",
+      "fail_to": "step_6",
+      "type": "conditional_branch"
+    }
+  ],
+  "error_handling": {
+    "global_timeout_seconds": 30,
+    "on_workflow_failure": "Send alert to #intake-errors Slack channel with error details and halt processing"
+  },
+  "output": {
+    "destination": "Webhook HTTP response + Slack #new-clients channel",
+    "format": "JSON HTTP response to Typeform; Markdown message to Slack",
+    "description": "Returns a success/failure status to the Typeform webhook caller, and posts a client notification to the team Slack channel"
+  },
+  "security": {
+    "credentials_needed": [
+      "CRM API key (HTTP header auth)",
+      "Slack incoming webhook URL"
+    ],
+    "pii_handling": "Client PII (name, email, phone) is transmitted over HTTPS only; not logged or stored outside CRM",
+    "data_flow": "Typeform -> n8n webhook -> CRM API -> Slack webhook; no data persisted in n8n"
+  },
+  "cost_estimate": "~$0.00 per run (no LLM calls; only HTTP API requests to CRM and Slack)",
+  "test_cases": [
+    {
+      "name": "Happy path - new client submission",
+      "input": {
+        "body": {
+          "event_id": "evt_abc123",
+          "event_type": "form_response",
+          "form_response": {
+            "submitted_at": "2024-01-15T10:30:00Z",
+            "answers": [
+              {
+                "type": "email",
+                "email": "jane.doe@example.com",
+                "field": {
+                  "ref": "email_field"
+                }
+              },
+              {
+                "type": "short_text",
+                "text": "Jane Doe",
+                "field": {
+                  "ref": "name_field"
+                }
+              },
+              {
+                "type": "phone_number",
+                "phone_number": "+1-555-123-4567",
+                "field": {
+                  "ref": "phone_field"
+                }
+              },
+              {
+                "type": "short_text",
+                "text": "Acme Corp",
+                "field": {
+                  "ref": "company_field"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "status": "success",
+        "action_taken": "created",
+        "client_id": "any non-empty string",
+        "slack_notification_sent": true
+      }
+    },
+    {
+      "name": "Existing client update path",
+      "input": {
+        "body": {
+          "event_id": "evt_def456",
+          "event_type": "form_response",
+          "form_response": {
+            "submitted_at": "2024-01-16T09:00:00Z",
+            "answers": [
+              {
+                "type": "email",
+                "email": "existing.client@example.com",
+                "field": {
+                  "ref": "email_field"
+                }
+              },
+              {
+                "type": "short_text",
+                "text": "Existing Client",
+                "field": {
+                  "ref": "name_field"
+                }
+              },
+              {
+                "type": "phone_number",
+                "phone_number": "+1-555-987-6543",
+                "field": {
+                  "ref": "phone_field"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "status": "success",
+        "action_taken": "updated",
+        "client_id": "any non-empty string",
+        "slack_notification_sent": true
+      }
+    },
+    {
+      "name": "Missing required fields - email absent",
+      "input": {
+        "body": {
+          "event_id": "evt_ghi789",
+          "event_type": "form_response",
+          "form_response": {
+            "submitted_at": "2024-01-15T11:00:00Z",
+            "answers": [
+              {
+                "type": "short_text",
+                "text": "John Smith",
+                "field": {
+                  "ref": "name_field"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "slack_error_alert_sent": true,
+        "crm_record_created": false,
+        "validation_failed": true
+      }
+    },
+    {
+      "name": "CRM API unavailable - retry behavior",
+      "input": {
+        "body": {
+          "event_id": "evt_jkl012",
+          "event_type": "form_response",
+          "form_response": {
+            "submitted_at": "2024-01-15T12:00:00Z",
+            "answers": [
+              {
+                "type": "email",
+                "email": "retry.test@example.com",
+                "field": {
+                  "ref": "email_field"
+                }
+              },
+              {
+                "type": "short_text",
+                "text": "Retry Test User",
+                "field": {
+                  "ref": "name_field"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "retry_attempts": 3,
+        "error_alert_to_slack": true,
+        "workflow_halted_gracefully": true
+      }
+    }
+  ],
+  "components_used": [],
+  "components_needed": []
+}

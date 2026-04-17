@@ -1,0 +1,3 @@
+[tool.pytest.ini_options]
+# test_runner.py is the TEST phase module, not a test file
+testpaths = ["agents"]

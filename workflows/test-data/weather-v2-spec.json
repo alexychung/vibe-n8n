@@ -1,0 +1,605 @@
+{
+  "workflow_name": "Daily NYC Weather Summary with Freezing Alerts",
+  "description": "Fetches daily weather data for New York City from Open-Meteo every morning and sends a formatted email summary with prominent freezing temperature alerts.",
+  "trigger": {
+    "type": "cron",
+    "schedule": "0 7 * * *",
+    "description": "Runs every day at 7:00 AM America/New_York time. Timezone is set directly on the scheduleTrigger node for self-contained operation independent of instance timezone."
+  },
+  "steps": [
+    {
+      "id": "step_1",
+      "name": "Daily 7AM Schedule Trigger",
+      "node_type": "n8n-nodes-base.scheduleTrigger",
+      "determinism": "1.0",
+      "description": "Fires every morning at 7:00 AM America/New_York. Timezone is configured directly on the node so it is instance-timezone-independent.",
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *",
+              "timezone": "America/New_York"
+            }
+          ]
+        }
+      },
+      "output_shape": {},
+      "error_handling": "No special handling needed \u2014 trigger failure means workflow never starts."
+    },
+    {
+      "id": "step_2",
+      "name": "Fetch NYC Weather from Open-Meteo",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Calls the Open-Meteo API to retrieve current daily weather for New York City (lat 40.7128, lon -74.0060), requesting temperature max/min, apparent temperature, precipitation (inches), wind speed, and weather code.",
+      "parameters": {
+        "url": "https://api.open-meteo.com/v1/forecast",
+        "method": "GET",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "latitude",
+              "value": "40.7128"
+            },
+            {
+              "name": "longitude",
+              "value": "-74.0060"
+            },
+            {
+              "name": "daily",
+              "value": "temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,windspeed_10m_max,weathercode"
+            },
+            {
+              "name": "current_weather",
+              "value": "true"
+            },
+            {
+              "name": "temperature_unit",
+              "value": "fahrenheit"
+            },
+            {
+              "name": "windspeed_unit",
+              "value": "mph"
+            },
+            {
+              "name": "precipitation_unit",
+              "value": "inch"
+            },
+            {
+              "name": "timezone",
+              "value": "America/New_York"
+            },
+            {
+              "name": "forecast_days",
+              "value": "1"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "output_shape": {
+        "current_weather": {
+          "temperature": "number",
+          "windspeed": "number",
+          "weathercode": "number"
+        },
+        "daily": {
+          "temperature_2m_max": "array",
+          "temperature_2m_min": "array",
+          "apparent_temperature_max": "array",
+          "apparent_temperature_min": "array",
+          "precipitation_sum": "array",
+          "windspeed_10m_max": "array",
+          "weathercode": "array",
+          "time": "array"
+        }
+      },
+      "error_handling": "Retry up to 3 times with 2-second waits. If all retries fail, the global error handler fires and logs 'Weather data unavailable today' with timestamp."
+    },
+    {
+      "id": "step_3",
+      "name": "Parse and Format Weather Summary",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Parses the Open-Meteo response with full null/undefined guards and date validation, maps weather codes to descriptions, checks for freezing conditions, builds fully-formatted HTML email body with prominent freeze warnings and a date-mismatch warning banner when applicable. Subject line reflects hard freeze vs standard freeze severity. Validates that daily.time[0] matches today's date in America/New_York timezone and surfaces a visible warning in the email if there is a mismatch.",
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\n// --- Defensive validation ---\nif (!data || typeof data !== 'object') {\n  throw new Error('Open-Meteo response is null or not an object.');\n}\nif (!data.daily || typeof data.daily !== 'object') {\n  throw new Error('Open-Meteo response missing \"daily\" field.');\n}\nif (!data.current_weather || typeof data.current_weather !== 'object') {\n  throw new Error('Open-Meteo response missing \"current_weather\" field.');\n}\nconst requiredArrays = ['temperature_2m_max','temperature_2m_min','apparent_temperature_max','apparent_temperature_min','precipitation_sum','windspeed_10m_max','weathercode','time'];\nfor (const key of requiredArrays) {\n  if (!Array.isArray(data.daily[key]) || data.daily[key].length === 0) {\n    throw new Error(`Open-Meteo daily.${key} is missing or empty.`);\n  }\n}\n\n// --- Date validation against today in America/New_York ---\nconst todayNY = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); // YYYY-MM-DD\nconst apiDate = data.daily.time[0];\nconst dateMismatch = apiDate !== todayNY;\nif (dateMismatch) {\n  console.warn(`Date mismatch: API returned ${apiDate}, expected ${todayNY}. Possible timezone edge case or API caching.`);\n}\n\nconst weatherCodeMap = {\n  0: 'Clear sky \u2600\ufe0f',\n  1: 'Mainly clear \ud83c\udf24\ufe0f',\n  2: 'Partly cloudy \u26c5',\n  3: 'Overcast \u2601\ufe0f',\n  45: 'Fog \ud83c\udf2b\ufe0f',\n  48: 'Icy fog \ud83c\udf2b\ufe0f\u2744\ufe0f',\n  51: 'Light drizzle \ud83c\udf26\ufe0f',\n  53: 'Moderate drizzle \ud83c\udf26\ufe0f',\n  55: 'Dense drizzle \ud83c\udf27\ufe0f',\n  61: 'Slight rain \ud83c\udf27\ufe0f',\n  63: 'Moderate rain \ud83c\udf27\ufe0f',\n  65: 'Heavy rain \ud83c\udf27\ufe0f',\n  71: 'Slight snow \ud83c\udf28\ufe0f',\n  73: 'Moderate snow \ud83c\udf28\ufe0f',\n  75: 'Heavy snow \u2744\ufe0f\ud83c\udf28\ufe0f',\n  77: 'Snow grains \ud83c\udf28\ufe0f',\n  80: 'Slight showers \ud83c\udf26\ufe0f',\n  81: 'Moderate showers \ud83c\udf27\ufe0f',\n  82: 'Violent showers \u26c8\ufe0f',\n  85: 'Slight snow showers \ud83c\udf28\ufe0f',\n  86: 'Heavy snow showers \u2744\ufe0f',\n  95: 'Thunderstorm \u26c8\ufe0f',\n  96: 'Thunderstorm with hail \u26c8\ufe0f\ud83c\udf28\ufe0f',\n  99: 'Thunderstorm with heavy hail \u26c8\ufe0f\u2744\ufe0f'\n};\n\nconst daily = data.daily;\nconst current = data.current_weather;\n\nconst tempMax = daily.temperature_2m_max[0];\nconst tempMin = daily.temperature_2m_min[0];\nconst feelsMax = daily.apparent_temperature_max[0];\nconst feelsMin = daily.apparent_temperature_min[0];\nconst precip = daily.precipitation_sum[0];\nconst windMax = daily.windspeed_10m_max[0];\nconst weatherCode = daily.weathercode[0];\nconst currentTemp = current.temperature;\nconst currentWind = current.windspeed;\nconst date = daily.time[0];\n\nconst conditionDesc = weatherCodeMap[weatherCode] || `Code ${weatherCode}`;\n\n// Freezing checks\nconst isHardFreeze = tempMin <= 28;\nconst isFreezing = tempMin <= 32;\nconst isFeelsFreezing = feelsMin <= 32;\nconst isFrostRisk = tempMin <= 36;\n\nlet freezeAlertHtml = '';\nlet freezeAlertText = '';\nlet hasFreezeAlert = false;\nlet alertSeverity = 'none';\n\nif (isHardFreeze) {\n  hasFreezeAlert = true;\n  alertSeverity = 'hard_freeze';\n  freezeAlertHtml = `<div style=\"background:#8B0000;color:#fff;padding:16px;border-radius:8px;margin-bottom:16px;font-size:18px;font-weight:bold;\">\ud83d\udea8\u2744\ufe0f HARD FREEZE WARNING \u2744\ufe0f\ud83d\udea8<br/>Low of ${tempMin}\u00b0F \u2014 Pipes may freeze! Take precautions immediately.</div>`;\n  freezeAlertText = `\ud83d\udea8\u2744\ufe0f HARD FREEZE WARNING \u2744\ufe0f\ud83d\udea8\\nLow of ${tempMin}\u00b0F \u2014 Pipes may freeze! Take precautions immediately.\\n\\n`;\n} else if (isFreezing) {\n  hasFreezeAlert = true;\n  alertSeverity = 'freeze';\n  freezeAlertHtml = `<div style=\"background:#00008B;color:#fff;padding:16px;border-radius:8px;margin-bottom:16px;font-size:18px;font-weight:bold;\">\u2744\ufe0f FREEZE ALERT \u2744\ufe0f<br/>Low of ${tempMin}\u00b0F \u2014 Temperatures at or below freezing tonight!</div>`;\n  freezeAlertText = `\u2744\ufe0f FREEZE ALERT \u2744\ufe0f\\nLow of ${tempMin}\u00b0F \u2014 Temperatures at or below freezing tonight!\\n\\n`;\n} else if (isFeelsFreezing) {\n  hasFreezeAlert = true;\n  alertSeverity = 'wind_chill';\n  freezeAlertHtml = `<div style=\"background:#4169E1;color:#fff;padding:16px;border-radius:8px;margin-bottom:16px;font-size:16px;font-weight:bold;\">\ud83e\udd76 WIND CHILL FREEZE ALERT \ud83e\udd76<br/>Feels as low as ${feelsMin}\u00b0F \u2014 Dress warmly, wind chill is dangerous!</div>`;\n  freezeAlertText = `\ud83e\udd76 WIND CHILL FREEZE ALERT \ud83e\udd76\\nFeels as low as ${feelsMin}\u00b0F \u2014 Dress warmly!\\n\\n`;\n} else if (isFrostRisk) {\n  hasFreezeAlert = true;\n  alertSeverity = 'frost';\n  freezeAlertHtml = `<div style=\"background:#708090;color:#fff;padding:14px;border-radius:8px;margin-bottom:16px;font-size:15px;font-weight:bold;\">\u26a0\ufe0f FROST RISK \u26a0\ufe0f<br/>Low of ${tempMin}\u00b0F \u2014 Near-freezing conditions possible.</div>`;\n  freezeAlertText = `\u26a0\ufe0f FROST RISK \u26a0\ufe0f\\nLow of ${tempMin}\u00b0F \u2014 Near-freezing conditions possible.\\n\\n`;\n}\n\n// Date mismatch visible warning banner\nlet dateMismatchHtml = '';\nlet dateMismatchText = '';\nif (dateMismatch) {\n  dateMismatchHtml = `<div style=\"background:#FFD700;color:#333;padding:12px;border-radius:8px;margin-bottom:16px;font-size:14px;font-weight:bold;\">\u26a0\ufe0f Date mismatch detected \u2014 API returned ${apiDate}, expected ${todayNY}. Data may be from a different date.</div>`;\n  dateMismatchText = `\u26a0\ufe0f Date mismatch detected \u2014 API returned ${apiDate}, expected ${todayNY}. Data may be from a different date.\\n\\n`;\n}\n\n// Subject line reflects severity\nlet subjectPrefix;\nif (alertSeverity === 'hard_freeze') {\n  subjectPrefix = `\ud83d\udea8 HARD FREEZE WARNING`;\n} else if (alertSeverity === 'freeze') {\n  subjectPrefix = `\u2744\ufe0f FREEZE ALERT`;\n} else if (alertSeverity === 'wind_chill') {\n  subjectPrefix = `\ud83e\udd76 WIND CHILL FREEZE ALERT`;\n} else if (alertSeverity === 'frost') {\n  subjectPrefix = `\u26a0\ufe0f FROST RISK`;\n} else {\n  subjectPrefix = `\ud83c\udf06 NYC Weather`;\n}\n\nconst subject = `${subjectPrefix} \u2014 NYC Weather: High ${tempMax}\u00b0F / Low ${tempMin}\u00b0F | ${conditionDesc}`;\n\nconst htmlBody = `\n<html>\n<body style=\"font-family:Arial,sans-serif;max-width:600px;margin:auto;padding:20px;\">\n  <h1 style=\"color:#1a1a2e;\">\ud83c\udf06 NYC Daily Weather Summary</h1>\n  <p style=\"color:#666;\">\ud83d\udcc5 ${date} | New York City</p>\n  <hr/>\n  ${dateMismatchHtml}\n  ${freezeAlertHtml}\n  <table style=\"width:100%;border-collapse:collapse;margin-top:12px;\">\n    <tr style=\"background:#f0f4ff;\">\n      <td style=\"padding:10px;font-weight:bold;\">\ud83c\udf21\ufe0f Temperature at 7AM</td>\n      <td style=\"padding:10px;\">${currentTemp}\u00b0F</td>\n    </tr>\n    <tr>\n      <td style=\"padding:10px;font-weight:bold;\">\ud83d\udd3c High</td>\n      <td style=\"padding:10px;\">${tempMax}\u00b0F <span style=\"color:#888;\">(Feels like ${feelsMax}\u00b0F)</span></td>\n    </tr>\n    <tr style=\"background:#f0f4ff;\">\n      <td style=\"padding:10px;font-weight:bold;\">\ud83d\udd3d Low</td>\n      <td style=\"padding:10px;${tempMin <= 32 ? 'color:#00008B;font-weight:bold;' : ''}\">${tempMin}\u00b0F <span style=\"color:#888;\">(Feels like ${feelsMin}\u00b0F)</span>${tempMin <= 32 ? ' \u2744\ufe0f' : ''}</td>\n    </tr>\n    <tr>\n      <td style=\"padding:10px;font-weight:bold;\">\ud83c\udf24\ufe0f Conditions</td>\n      <td style=\"padding:10px;\">${conditionDesc}</td>\n    </tr>\n    <tr style=\"background:#f0f4ff;\">\n      <td style=\"padding:10px;font-weight:bold;\">\ud83d\udca8 Max Wind Speed</td>\n      <td style=\"padding:10px;\">${windMax} mph (Current: ${currentWind} mph)</td>\n    </tr>\n    <tr>\n      <td style=\"padding:10px;font-weight:bold;\">\ud83c\udf27\ufe0f Precipitation</td>\n      <td style=\"padding:10px;\">${precip} inches</td>\n    </tr>\n  </table>\n  <hr style=\"margin-top:20px;\"/>\n  <p style=\"color:#aaa;font-size:12px;\">Data sourced from Open-Meteo (open-meteo.com) \u2014 Free weather API</p>\n</body>\n</html>\n`;\n\nconst plainText = `NYC Daily Weather Summary\\n========================\\nDate: ${date}\\n\\n${dateMismatchText}${freezeAlertText}Temperature at 7AM: ${currentTemp}\u00b0F\\nHigh: ${tempMax}\u00b0F (Feels like ${feelsMax}\u00b0F)\\nLow: ${tempMin}\u00b0F (Feels like ${feelsMin}\u00b0F)${tempMin <= 32 ? ' \u2744\ufe0f FREEZING' : ''}\\nConditions: ${conditionDesc}\\nMax Wind: ${windMax} mph (Current: ${currentWind} mph)\\nPrecipitation: ${precip} inches\\n\\nData: open-meteo.com`;\n\nreturn [{\n  json: {\n    subject,\n    htmlBody,\n    plainText,\n    hasFreezeAlert,\n    alertSeverity,\n    dateMismatch,\n    tempMax,\n    tempMin,\n    feelsMax,\n    feelsMin,\n    currentTemp,\n    currentWind,\n    windMax,\n    precip,\n    conditionDesc,\n    date\n  }\n}];\n"
+      },
+      "output_shape": {
+        "subject": "string",
+        "htmlBody": "string",
+        "plainText": "string",
+        "hasFreezeAlert": "boolean",
+        "alertSeverity": "string",
+        "dateMismatch": "boolean",
+        "tempMax": "number",
+        "tempMin": "number",
+        "feelsMax": "number",
+        "feelsMin": "number",
+        "currentTemp": "number",
+        "currentWind": "number",
+        "windMax": "number",
+        "precip": "number",
+        "conditionDesc": "string",
+        "date": "string"
+      },
+      "error_handling": "Throws descriptive errors for missing/malformed API response fields. Renders a visible yellow warning banner in the email body if the API date does not match today's NYC date so the recipient is immediately aware of potential stale data."
+    },
+    {
+      "id": "step_4",
+      "name": "Send NYC Weather Email",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Sends the formatted HTML weather email via SendGrid API. The Authorization header is supplied by an n8n 'HTTP Header Auth' credential (credential name: SendGrid API Key) which stores the full 'Bearer <YOUR_SENDGRID_API_KEY>' value \u2014 no raw API key expressions in the node. Recipient and sender emails are read from n8n environment variables WEATHER_RECIPIENT_EMAIL and WEATHER_SENDER_EMAIL so they can be configured without editing the workflow JSON.",
+      "parameters": {
+        "url": "https://api.sendgrid.com/v3/mail/send",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "credential": {
+          "name": "SendGrid API Key",
+          "note": "Create this credential in n8n as HTTP Header Auth. Set header name to 'Authorization' and value to 'Bearer YOUR_SENDGRID_API_KEY'."
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "body": {
+          "personalizations": [
+            {
+              "to": [
+                {
+                  "email": "={{ $env.WEATHER_RECIPIENT_EMAIL }}"
+                }
+              ]
+            }
+          ],
+          "from": {
+            "email": "={{ $env.WEATHER_SENDER_EMAIL }}",
+            "name": "NYC Weather Bot"
+          },
+          "subject": "={{ $json.subject }}",
+          "content": [
+            {
+              "type": "text/plain",
+              "value": "={{ $json.plainText }}"
+            },
+            {
+              "type": "text/html",
+              "value": "={{ $json.htmlBody }}"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 2,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "output_shape": {
+        "statusCode": "number"
+      },
+      "error_handling": "Retry twice with 2-second waits. A 401 response indicates the SendGrid HTTP Header Auth credential is misconfigured (wrong key or missing 'Bearer ' prefix). A 400 response indicates malformed body or missing required fields. Global error handler notifies developer on failure."
+    }
+  ],
+  "gates": [],
+  "error_handling": {
+    "global_timeout_seconds": 60,
+    "on_workflow_failure": "Log error with timestamp. Notify developer via secondary channel if possible, including a clear message such as 'Weather data unavailable today \u2014 workflow failed at [step name]' so the absence of the daily email is explained."
+  },
+  "output": {
+    "destination": "Email inbox (configured via WEATHER_RECIPIENT_EMAIL environment variable)",
+    "format": "HTML email with plain-text fallback",
+    "description": "Daily HTML email with NYC weather summary table; freeze/frost alerts displayed as colored banners at the top with bold text and emoji; a yellow warning banner is shown if the API date does not match today's NYC date; subject line reflects alert severity (Hard Freeze Warning > Freeze Alert > Wind Chill Freeze Alert > Frost Risk > normal). Temperature at 7AM is labeled clearly to avoid confusion with daily high/low forecasts."
+  },
+  "security": {
+    "credentials_needed": [
+      "SendGrid API Key: Create an n8n 'HTTP Header Auth' credential named 'SendGrid API Key'. Set header name to 'Authorization' and value to 'Bearer YOUR_SENDGRID_API_KEY'. Do NOT paste the key into the node expression directly.",
+      "WEATHER_RECIPIENT_EMAIL: Set as an n8n environment variable. The email address that will receive the daily weather summary.",
+      "WEATHER_SENDER_EMAIL: Set as an n8n environment variable. A SendGrid-verified sender email address."
+    ],
+    "pii_handling": "No PII processed. Only weather data and static/env-configured email addresses.",
+    "data_flow": "Open-Meteo API \u2192 n8n (transform) \u2192 SendGrid API. No data stored persistently."
+  },
+  "configuration": {
+    "required_environment_variables": [
+      {
+        "name": "WEATHER_RECIPIENT_EMAIL",
+        "description": "Email address to receive the daily NYC weather summary. Must be set before first run.",
+        "example": "you@yourdomain.com"
+      },
+      {
+        "name": "WEATHER_SENDER_EMAIL",
+        "description": "Verified sender email address in your SendGrid account. Must be set before first run.",
+        "example": "weather-bot@yourdomain.com"
+      }
+    ],
+    "required_credentials": [
+      {
+        "name": "SendGrid API Key",
+        "type": "HTTP Header Auth",
+        "header_name": "Authorization",
+        "header_value_format": "Bearer YOUR_SENDGRID_API_KEY",
+        "note": "The full 'Bearer ' prefix must be included in the credential value."
+      }
+    ]
+  },
+  "cost_estimate": "$0.00 per run (Open-Meteo is free; SendGrid free tier covers 100 emails/day). Effectively $0/month for this use case.",
+  "timezone_requirements": "The cron trigger has timezone: America/New_York set directly on the node rule, making it self-contained and independent of the n8n instance timezone setting. No instance-level timezone configuration is required.",
+  "test_cases": [
+    {
+      "name": "Happy path \u2014 mild day, no freeze alert",
+      "input": {
+        "trigger": "schedule",
+        "mock_api_response": {
+          "current_weather": {
+            "temperature": 58,
+            "windspeed": 10,
+            "weathercode": 1
+          },
+          "daily": {
+            "time": [
+              "2024-04-15"
+            ],
+            "temperature_2m_max": [
+              65
+            ],
+            "temperature_2m_min": [
+              48
+            ],
+            "apparent_temperature_max": [
+              63
+            ],
+            "apparent_temperature_min": [
+              44
+            ],
+            "precipitation_sum": [
+              0.0
+            ],
+            "windspeed_10m_max": [
+              15
+            ],
+            "weathercode": [
+              1
+            ]
+          }
+        }
+      },
+      "expected": {
+        "subject": "\ud83c\udf06 NYC Weather \u2014 NYC Weather: High 65\u00b0F / Low 48\u00b0F | Mainly clear \ud83c\udf24\ufe0f",
+        "hasFreezeAlert": false,
+        "alertSeverity": "none",
+        "dateMismatch": false,
+        "email_sent": true,
+        "htmlBody": "any non-empty string"
+      }
+    },
+    {
+      "name": "Freezing alert \u2014 temperature at or below 32\u00b0F but above 28\u00b0F",
+      "input": {
+        "trigger": "schedule",
+        "mock_api_response": {
+          "current_weather": {
+            "temperature": 30,
+            "windspeed": 12,
+            "weathercode": 71
+          },
+          "daily": {
+            "time": [
+              "2024-01-15"
+            ],
+            "temperature_2m_max": [
+              33
+            ],
+            "temperature_2m_min": [
+              30
+            ],
+            "apparent_temperature_max": [
+              25
+            ],
+            "apparent_temperature_min": [
+              18
+            ],
+            "precipitation_sum": [
+              0.1
+            ],
+            "windspeed_10m_max": [
+              18
+            ],
+            "weathercode": [
+              71
+            ]
+          }
+        }
+      },
+      "expected": {
+        "subject": "\u2744\ufe0f FREEZE ALERT \u2014 NYC Weather: High 33\u00b0F / Low 30\u00b0F | Slight snow \ud83c\udf28\ufe0f",
+        "hasFreezeAlert": true,
+        "alertSeverity": "freeze",
+        "email_sent": true,
+        "htmlBody": "any non-empty string"
+      }
+    },
+    {
+      "name": "Hard freeze warning \u2014 temperature at or below 28\u00b0F",
+      "input": {
+        "trigger": "schedule",
+        "mock_api_response": {
+          "current_weather": {
+            "temperature": 18,
+            "windspeed": 25,
+            "weathercode": 75
+          },
+          "daily": {
+            "time": [
+              "2024-01-20"
+            ],
+            "temperature_2m_max": [
+              24
+            ],
+            "temperature_2m_min": [
+              14
+            ],
+            "apparent_temperature_max": [
+              10
+            ],
+            "apparent_temperature_min": [
+              2
+            ],
+            "precipitation_sum": [
+              0.5
+            ],
+            "windspeed_10m_max": [
+              30
+            ],
+            "weathercode": [
+              75
+            ]
+          }
+        }
+      },
+      "expected": {
+        "subject": "\ud83d\udea8 HARD FREEZE WARNING \u2014 NYC Weather: High 24\u00b0F / Low 14\u00b0F | Heavy snow \u2744\ufe0f\ud83c\udf28\ufe0f",
+        "hasFreezeAlert": true,
+        "alertSeverity": "hard_freeze",
+        "email_sent": true,
+        "htmlBody": "any non-empty string"
+      }
+    },
+    {
+      "name": "API failure \u2014 Open-Meteo returns error",
+      "input": {
+        "trigger": "schedule",
+        "mock_api_response": null,
+        "simulate_error": true
+      },
+      "expected": {
+        "workflow_status": "failed",
+        "email_sent": false,
+        "error_logged": true
+      }
+    },
+    {
+      "name": "Wind chill freeze \u2014 air temp above 32 but feels below freezing",
+      "input": {
+        "trigger": "schedule",
+        "mock_api_response": {
+          "current_weather": {
+            "temperature": 35,
+            "windspeed": 28,
+            "weathercode": 3
+          },
+          "daily": {
+            "time": [
+              "2024-02-05"
+            ],
+            "temperature_2m_max": [
+              40
+            ],
+            "temperature_2m_min": [
+              34
+            ],
+            "apparent_temperature_max": [
+              30
+            ],
+            "apparent_temperature_min": [
+              20
+            ],
+            "precipitation_sum": [
+              0.0
+            ],
+            "windspeed_10m_max": [
+              32
+            ],
+            "weathercode": [
+              3
+            ]
+          }
+        }
+      },
+      "expected": {
+        "subject": "\ud83e\udd76 WIND CHILL FREEZE ALERT \u2014 NYC Weather: High 40\u00b0F / Low 34\u00b0F | Overcast \u2601\ufe0f",
+        "hasFreezeAlert": true,
+        "alertSeverity": "wind_chill",
+        "email_sent": true,
+        "htmlBody": "any non-empty string"
+      }
+    },
+    {
+      "name": "Frost risk \u2014 temperature between 33\u00b0F and 36\u00b0F",
+      "input": {
+        "trigger": "schedule",
+        "mock_api_response": {
+          "current_weather": {
+            "temperature": 40,
+            "windspeed": 8,
+            "weathercode": 2
+          },
+          "daily": {
+            "time": [
+              "2024-03-10"
+            ],
+            "temperature_2m_max": [
+              48
+            ],
+            "temperature_2m_min": [
+              35
+            ],
+            "apparent_temperature_max": [
+              44
+            ],
+            "apparent_temperature_min": [
+              33
+            ],
+            "precipitation_sum": [
+              0.0
+            ],
+            "windspeed_10m_max": [
+              10
+            ],
+            "weathercode": [
+              2
+            ]
+          }
+        }
+      },
+      "expected": {
+        "subject": "\u26a0\ufe0f FROST RISK \u2014 NYC Weather: High 48\u00b0F / Low 35\u00b0F | Partly cloudy \u26c5",
+        "hasFreezeAlert": true,
+        "alertSeverity": "frost",
+        "email_sent": true,
+        "htmlBody": "any non-empty string"
+      }
+    },
+    {
+      "name": "Malformed API response \u2014 missing daily field",
+      "input": {
+        "trigger": "schedule",
+        "mock_api_response": {
+          "current_weather": {
+            "temperature": 50,
+            "windspeed": 10,
+            "weathercode": 0
+          }
+        }
+      },
+      "expected": {
+        "workflow_status": "failed",
+        "error_message": "Open-Meteo response missing \"daily\" field.",
+        "email_sent": false,
+        "error_logged": true
+      }
+    },
+    {
+      "name": "Malformed API response \u2014 empty daily arrays",
+      "input": {
+        "trigger": "schedule",
+        "mock_api_response": {
+          "current_weather": {
+            "temperature": 50,
+            "windspeed": 10,
+            "weathercode": 0
+          },
+          "daily": {
+            "time": [],
+            "temperature_2m_max": [],
+            "temperature_2m_min": [],
+            "apparent_temperature_max": [],
+            "apparent_temperature_min": [],
+            "precipitation_sum": [],
+            "windspeed_10m_max": [],
+            "weathercode": []
+          }
+        }
+      },
+      "expected": {
+        "workflow_status": "failed",
+        "error_message_contains": "missing or empty",
+        "email_sent": false,
+        "error_logged": true
+      }
+    },
+    {
+      "name": "Date mismatch \u2014 API returns different date than today",
+      "input": {
+        "trigger": "schedule",
+        "mock_api_response": {
+          "current_weather": {
+            "temperature": 55,
+            "windspeed": 10,
+            "weathercode": 1
+          },
+          "daily": {
+            "time": [
+              "2024-04-14"
+            ],
+            "temperature_2m_max": [
+              60
+            ],
+            "temperature_2m_min": [
+              45
+            ],
+            "apparent_temperature_max": [
+              58
+            ],
+            "apparent_temperature_min": [
+              41
+            ],
+            "precipitation_sum": [
+              0.0
+            ],
+            "windspeed_10m_max": [
+              12
+            ],
+            "weathercode": [
+              1
+            ]
+          }
+        },
+        "simulated_today_ny": "2024-04-15"
+      },
+      "expected": {
+        "workflow_status": "success",
+        "dateMismatch": true,
+        "email_sent": true,
+        "htmlBody_contains": "Date mismatch detected",
+        "plainText_contains": "Date mismatch detected"
+      }
+    },
+    {
+      "name": "Missing WEATHER_RECIPIENT_EMAIL env var \u2014 SendGrid rejects request",
+      "input": {
+        "trigger": "schedule",
+        "simulate_missing_env": "WEATHER_RECIPIENT_EMAIL"
+      },
+      "expected": {
+        "workflow_status": "failed",
+        "email_sent": false,
+        "error_logged": true,
+        "note": "SendGrid will return 400 Bad Request if the to.email field is empty or missing."
+      }
+    },
+    {
+      "name": "Invalid SendGrid credential \u2014 401 response",
+      "input": {
+        "trigger": "schedule",
+        "simulate_sendgrid_response_code": 401
+      },
+      "expected": {
+        "workflow_status": "failed",
+        "email_sent": false,
+        "error_logged": true,
+        "note": "Indicates the HTTP Header Auth credential has a wrong or missing API key / Bearer prefix."
+      }
+    }
+  ],
+  "components_used": [],
+  "components_needed": []
+}

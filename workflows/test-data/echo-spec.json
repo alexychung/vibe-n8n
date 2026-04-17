@@ -1,0 +1,147 @@
+{
+  "workflow_name": "Webhook Echo",
+  "description": "Receives a POST, validates input, echoes back with status and timestamp",
+
+  "trigger": {
+    "type": "webhook",
+    "path": "echo-test",
+    "method": "POST",
+    "description": "Webhook receiving JSON POST"
+  },
+
+  "steps": [
+    {
+      "id": "step_1",
+      "name": "Validate Input",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Check that name is non-empty string and value is number 0-100",
+      "parameters": {
+        "conditions": {
+          "and": [
+            { "field": "={{ $json.body.name }}", "operation": "isNotEmpty" },
+            { "field": "={{ $json.body.value }}", "operation": "gte", "value": 0 },
+            { "field": "={{ $json.body.value }}", "operation": "lte", "value": 100 }
+          ]
+        }
+      },
+      "input_shape": { "name": "string", "value": "number" },
+      "output_shape": { "pass": "same as input", "fail": "same as input" },
+      "error_handling": { "on_failure": "route_to_error_branch" }
+    },
+    {
+      "id": "step_2",
+      "name": "Build Success Response",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Echo input back with status=ok and timestamp",
+      "parameters": {
+        "assignments": [
+          { "name": "status", "value": "ok", "type": "string" },
+          { "name": "name", "value": "={{ $json.body.name }}", "type": "string" },
+          { "name": "value", "value": "={{ $json.body.value }}", "type": "number" },
+          { "name": "received_at", "value": "={{ $now.toISO() }}", "type": "string" }
+        ]
+      },
+      "input_shape": { "name": "string", "value": "number" },
+      "output_shape": { "status": "string", "name": "string", "value": "number", "received_at": "string" }
+    },
+    {
+      "id": "step_3",
+      "name": "Build Error Response",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Return error when validation fails",
+      "parameters": {
+        "assignments": [
+          { "name": "status", "value": "error", "type": "string" },
+          { "name": "message", "value": "Invalid input: name must be non-empty, value must be 0-100", "type": "string" }
+        ]
+      },
+      "input_shape": "any",
+      "output_shape": { "status": "string", "message": "string" }
+    }
+  ],
+
+  "gates": [
+    {
+      "after_step": "step_1",
+      "type": "conditional_branch",
+      "description": "Route valid input to success response, invalid to error response",
+      "pass_to": "step_2",
+      "fail_to": "step_3"
+    }
+  ],
+
+  "error_handling": {
+    "global_timeout_seconds": 30,
+    "on_workflow_failure": "return_error_response"
+  },
+
+  "output": {
+    "destination": "webhook_response",
+    "format": "JSON",
+    "description": "Returns JSON response to the webhook caller"
+  },
+
+  "security": {
+    "credentials_needed": [],
+    "pii_handling": "none",
+    "data_flow_notes": "No external calls. Input echoed back to caller."
+  },
+
+  "cost_estimate": {
+    "per_run": {
+      "api_calls": "0 (no external APIs)",
+      "estimated_tokens": "0",
+      "estimated_cost": "$0"
+    }
+  },
+
+  "test_cases": [
+    {
+      "name": "Happy path",
+      "input": { "name": "test-item", "value": 42 },
+      "expected": {
+        "status": "ok",
+        "name": "test-item",
+        "value": 42,
+        "received_at": "any non-empty string"
+      }
+    },
+    {
+      "name": "Empty name rejected",
+      "input": { "name": "", "value": 50 },
+      "expected": {
+        "status": "error",
+        "message": "Invalid input: name must be non-empty, value must be 0-100"
+      }
+    },
+    {
+      "name": "Value too high rejected",
+      "input": { "name": "test", "value": 150 },
+      "expected": {
+        "status": "error",
+        "message": "Invalid input: name must be non-empty, value must be 0-100"
+      }
+    },
+    {
+      "name": "Value negative rejected",
+      "input": { "name": "test", "value": -5 },
+      "expected": {
+        "status": "error",
+        "message": "Invalid input: name must be non-empty, value must be 0-100"
+      }
+    },
+    {
+      "name": "Missing fields rejected",
+      "input": {},
+      "expected": {
+        "status": "error"
+      }
+    }
+  ],
+
+  "components_used": [],
+  "components_needed": []
+}

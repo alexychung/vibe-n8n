@@ -1,0 +1,677 @@
+{
+  "workflow_name": "Weekly Tech News Digest - RSS to Webhook",
+  "description": "Every Monday morning, fetches the latest posts from TechCrunch, Hacker News, and The Verge RSS feeds in parallel, extracts titles and links, groups them by source, and delivers a structured payload to a webhook endpoint.",
+  "trigger": {
+    "type": "cron",
+    "schedule": "0 7 * * 1",
+    "description": "Runs every Monday at 7:00 AM"
+  },
+  "steps": [
+    {
+      "id": "step_1",
+      "name": "Schedule Trigger - Every Monday 7AM",
+      "node_type": "n8n-nodes-base.scheduleTrigger",
+      "determinism": "1.0",
+      "description": "Fires every Monday at 7:00 AM to kick off the RSS collection workflow. Fans out to all three feed fetches in parallel.",
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * 1"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "timestamp": "ISO datetime of trigger"
+      },
+      "error_handling": "No error handling needed for trigger."
+    },
+    {
+      "id": "step_2",
+      "name": "Fetch TechCrunch RSS Feed",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Fetches the TechCrunch RSS feed XML from their public feed URL in parallel with step_4 and step_6. continueOnFail is enabled so a feed failure produces an error item rather than halting the workflow. Retry settings are top-level node parameters.",
+      "parameters": {
+        "url": "https://techcrunch.com/feed/",
+        "method": "GET",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "output_shape": {
+        "body": "Raw RSS XML string from TechCrunch"
+      },
+      "error_handling": "continueOnFail: true ensures feed failure produces an error item. Retry up to 3 times (top-level node settings); on final failure, produce error item and continue to allow other feeds to succeed. Per-request timeout is 10s to keep worst-case within global timeout bounds."
+    },
+    {
+      "id": "step_3",
+      "name": "Parse TechCrunch RSS Items",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Parses TechCrunch RSS XML, extracts title and link for each item, and tags each with the source name. Handles CDATA-wrapped titles. Skips links with rel=self, rel=hub to avoid picking up feed self-reference URLs. Guards against continueOnFail error items (no body field) by checking for xml truthiness.",
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\nconst SKIP_REL = /rel=['\"](?:self|hub)['\"]/ ;\nfor (const item of items) {\n  const xml = (typeof item.json.body === 'string' ? item.json.body : '') ||\n               (typeof item.json.data === 'string' ? item.json.data : '');\n  if (!xml) continue;\n  const matches = [...xml.matchAll(/<item[^>]*>[\\s\\S]*?<\\/item>/gi)];\n  for (const match of matches) {\n    const block = match[0];\n    const titleMatch = block.match(/<title[^>]*>(?:<!\\[CDATA\\[)?(.*?)(?:\\]\\]>)?<\\/title>/s);\n    // Try plain <link>...</link> first\n    let link = '';\n    const plainLink = block.match(/<link>([^<]+)<\\/link>/);\n    if (plainLink) {\n      link = plainLink[1].trim();\n    } else {\n      // Try self-closing Atom-style <link .../> but skip rel=self and rel=hub\n      const allAtomLinks = [...block.matchAll(/<link([^>]*)\\/>/gi)];\n      for (const al of allAtomLinks) {\n        const attrs = al[1];\n        if (SKIP_REL.test(attrs)) continue;\n        const hrefMatch = attrs.match(/href=['\"]([^'\"]+)['\"]/);\n        if (hrefMatch) { link = hrefMatch[1].trim(); break; }\n      }\n    }\n    let title = titleMatch ? titleMatch[1].replace(/<!\\[CDATA\\[/g,'').replace(/\\]\\]>/g,'').trim() : '';\n    if (title && link) {\n      results.push({ json: { source: 'TechCrunch', title, link } });\n    }\n  }\n}\nreturn results;"
+      },
+      "output_shape": {
+        "source": "TechCrunch",
+        "title": "Post title string",
+        "link": "Post URL string"
+      },
+      "error_handling": "Returns empty array on parse failure or empty feed so workflow continues cleanly."
+    },
+    {
+      "id": "step_4",
+      "name": "Fetch Hacker News RSS Feed",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Fetches the Hacker News RSS feed XML from their public feed URL in parallel with step_2 and step_6. continueOnFail is enabled so a feed failure produces an error item rather than halting the workflow. Retry settings are top-level node parameters.",
+      "parameters": {
+        "url": "https://news.ycombinator.com/rss",
+        "method": "GET",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "output_shape": {
+        "body": "Raw RSS XML string from Hacker News"
+      },
+      "error_handling": "continueOnFail: true ensures feed failure produces an error item. Retry up to 3 times (top-level node settings); on final failure, produce error item and continue."
+    },
+    {
+      "id": "step_5",
+      "name": "Parse Hacker News RSS Items",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Parses Hacker News RSS XML, extracts title and link for each item, and tags each with the source name. NOTE: The HN RSS <link> element contains the HN discussion page URL (e.g. https://news.ycombinator.com/item?id=...), not the original article URL. This is by design \u2014 HN RSS does not include the original article URL as a direct <link> element; the original URL is embedded in the <description> HTML. This workflow captures the HN discussion link. If the original article link is desired, the <description> field would need to be parsed for the href. Handles CDATA-wrapped titles.",
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\nfor (const item of items) {\n  const xml = (typeof item.json.body === 'string' ? item.json.body : '') ||\n               (typeof item.json.data === 'string' ? item.json.data : '');\n  if (!xml) continue;\n  const matches = [...xml.matchAll(/<item[^>]*>[\\s\\S]*?<\\/item>/gi)];\n  for (const match of matches) {\n    const block = match[0];\n    const titleMatch = block.match(/<title[^>]*>(?:<!\\[CDATA\\[)?(.*?)(?:\\]\\]>)?<\\/title>/s);\n    // HN RSS: <link> contains the HN discussion page URL\n    const linkMatch = block.match(/<link>([^<]+)<\\/link>/);\n    let title = titleMatch ? titleMatch[1].replace(/<!\\[CDATA\\[/g,'').replace(/\\]\\]>/g,'').trim() : '';\n    let link = linkMatch ? linkMatch[1].trim() : '';\n    if (title && link) {\n      results.push({ json: { source: 'Hacker News', title, link } });\n    }\n  }\n}\nreturn results;"
+      },
+      "output_shape": {
+        "source": "Hacker News",
+        "title": "Post title string",
+        "link": "HN discussion page URL (not original article URL \u2014 see description)"
+      },
+      "error_handling": "Returns empty array on parse failure or empty feed so workflow continues cleanly."
+    },
+    {
+      "id": "step_6",
+      "name": "Fetch The Verge RSS Feed",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Fetches The Verge RSS/Atom feed XML from their public feed URL in parallel with step_2 and step_4. continueOnFail is enabled so a feed failure produces an error item rather than halting the workflow. Retry settings are top-level node parameters.",
+      "parameters": {
+        "url": "https://www.theverge.com/rss/index.xml",
+        "method": "GET",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "output_shape": {
+        "body": "Raw RSS/Atom XML string from The Verge"
+      },
+      "error_handling": "continueOnFail: true ensures feed failure produces an error item. Retry up to 3 times (top-level node settings); on final failure, produce error item and continue."
+    },
+    {
+      "id": "step_7",
+      "name": "Parse The Verge RSS Items",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Parses The Verge RSS/Atom XML. Uses self-closing-tag-aware link regex and filters for rel=alternate to avoid rel=self and rel=hub. Handles CDATA with correctly escaped regex brackets.",
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\nconst SKIP_REL = /rel=['\"](?:self|hub)['\"]/ ;\nfor (const item of items) {\n  const xml = (typeof item.json.body === 'string' ? item.json.body : '') ||\n               (typeof item.json.data === 'string' ? item.json.data : '');\n  if (!xml) continue;\n  let matches = [...xml.matchAll(/<item[^>]*>[\\s\\S]*?<\\/item>/gi)];\n  if (matches.length === 0) {\n    matches = [...xml.matchAll(/<entry[^>]*>[\\s\\S]*?<\\/entry>/gi)];\n  }\n  for (const match of matches) {\n    const block = match[0];\n    const titleMatch = block.match(/<title[^>]*>(?:<!\\[CDATA\\[)?(.*?)(?:\\]\\]>)?<\\/title>/s);\n    let link = '';\n    // Prefer rel=alternate explicitly\n    const alternateLinkMatch = block.match(/<link[^>]+rel=['\"]alternate['\"][^>]+href=['\"]([^'\"]+)['\"][^>]*\\/?>/);\n    if (alternateLinkMatch) {\n      link = alternateLinkMatch[1].trim();\n    } else {\n      // Try all self-closing link tags, skip rel=self and rel=hub\n      const allAtomLinks = [...block.matchAll(/<link([^>]*)\\/>/gi)];\n      for (const al of allAtomLinks) {\n        const attrs = al[1];\n        if (SKIP_REL.test(attrs)) continue;\n        const hrefMatch = attrs.match(/href=['\"]([^'\"]+)['\"]/);\n        if (hrefMatch) { link = hrefMatch[1].trim(); break; }\n      }\n      // Fallback: plain RSS <link>\n      if (!link) {\n        const plainLink = block.match(/<link>([^<]+)<\\/link>/);\n        if (plainLink) link = plainLink[1].trim();\n      }\n    }\n    let title = titleMatch ? titleMatch[1].replace(/<!\\[CDATA\\[/g,'').replace(/\\]\\]>/g,'').replace(/<[^>]+>/g,'').trim() : '';\n    if (title && link) {\n      results.push({ json: { source: 'The Verge', title, link } });\n    }\n  }\n}\nreturn results;"
+      },
+      "output_shape": {
+        "source": "The Verge",
+        "title": "Post title string",
+        "link": "Post URL string"
+      },
+      "error_handling": "Returns empty array on parse failure or empty feed so workflow continues cleanly."
+    },
+    {
+      "id": "step_8a",
+      "name": "Merge TechCrunch and Hacker News Items",
+      "node_type": "n8n-nodes-base.merge",
+      "determinism": "1.0",
+      "description": "First merge stage: appends output of Parse TechCrunch RSS Items (step_3) and Parse Hacker News RSS Items (step_5) into a single stream. n8n Merge node in append mode accepts exactly 2 inputs; chaining two merge nodes handles the 3-feed case.",
+      "parameters": {
+        "mode": "append"
+      },
+      "output_shape": {
+        "items": "All parsed {source, title, link} items from TechCrunch and Hacker News"
+      },
+      "error_handling": "Merge node is passive; individual feed errors are handled upstream by continueOnFail and empty-array returns in parse nodes."
+    },
+    {
+      "id": "step_8b",
+      "name": "Merge All Three Feed Items",
+      "node_type": "n8n-nodes-base.merge",
+      "determinism": "1.0",
+      "description": "Second merge stage: appends the combined TechCrunch+HackerNews stream (step_8a) with Parse The Verge RSS Items (step_7) to produce a single stream containing all three feeds. This chained approach respects the n8n Merge node's 2-input constraint.",
+      "parameters": {
+        "mode": "append"
+      },
+      "output_shape": {
+        "items": "All parsed {source, title, link} items from all three feeds in a single stream"
+      },
+      "error_handling": "Merge node is passive; individual feed errors are handled upstream."
+    },
+    {
+      "id": "step_9",
+      "name": "Aggregate and Group All Feed Items",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Collects all parsed items from the merged stream, groups them by source (TechCrunch, Hacker News, The Verge), and builds a final payload with metadata.",
+      "parameters": {
+        "jsCode": "const allItems = $input.all();\n\nconst grouped = {\n  TechCrunch: [],\n  'Hacker News': [],\n  'The Verge': []\n};\n\nfor (const item of allItems) {\n  const source = item.json.source;\n  const title = item.json.title;\n  const link = item.json.link;\n  if (title && link && grouped.hasOwnProperty(source)) {\n    grouped[source].push({ title, link });\n  }\n}\n\nconst totalItems = grouped.TechCrunch.length + grouped['Hacker News'].length + grouped['The Verge'].length;\n\nreturn [{\n  json: {\n    collectedAt: new Date().toISOString(),\n    totalItems,\n    sources: grouped\n  }\n}];"
+      },
+      "output_shape": {
+        "collectedAt": "ISO datetime string",
+        "totalItems": "integer count of all posts",
+        "sources": {
+          "TechCrunch": "array of {title, link}",
+          "Hacker News": "array of {title, link} where link is HN discussion page",
+          "The Verge": "array of {title, link}"
+        }
+      },
+      "error_handling": "On error, return a payload with empty source arrays and totalItems=0."
+    },
+    {
+      "id": "step_9b",
+      "name": "Validate Webhook URL is Configured",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Guards against deployment without a configured webhook URL. Checks that TECH_DIGEST_WEBHOOK_URL is non-empty and does not equal the placeholder value. Routes to an error log if unconfigured so the payload is never silently sent to an unintended endpoint.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch_true": "URL is configured and not a placeholder \u2014 proceed to empty-check",
+        "branch_false": "URL is missing or placeholder \u2014 route to misconfiguration log"
+      },
+      "error_handling": "On evaluation error, treat as misconfigured and route to false branch."
+    },
+    {
+      "id": "step_9c",
+      "name": "Log Webhook URL Misconfiguration",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Sets an alert payload when the TECH_DIGEST_WEBHOOK_URL environment variable is not set or is still the placeholder value. Terminal step \u2014 developer should configure the env var before deploying.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c0",
+              "name": "alert",
+              "value": "TECH_DIGEST_WEBHOOK_URL is not configured or is still the placeholder value. Set this environment variable before deploying.",
+              "type": "string"
+            },
+            {
+              "id": "c1",
+              "name": "failedAt",
+              "value": "={{ new Date().toISOString() }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "alert": "Alert message string",
+        "failedAt": "ISO datetime string"
+      },
+      "error_handling": "Terminal logging step \u2014 no further error handling needed."
+    },
+    {
+      "id": "step_10",
+      "name": "Check Feed Data is Not Empty",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Validates that at least one item was collected across all three feeds before sending the webhook payload. Compares totalItems > 0.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch_true": "Passes when totalItems > 0",
+        "branch_false": "Passes when totalItems = 0"
+      },
+      "error_handling": "Route to failure branch if check cannot be evaluated."
+    },
+    {
+      "id": "step_11",
+      "name": "Send Digest Payload to Webhook",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "POSTs the grouped feed payload to the destination webhook endpoint. URL is supplied via n8n environment variable TECH_DIGEST_WEBHOOK_URL. Auth token is stored as n8n environment variable TECH_DIGEST_WEBHOOK_TOKEN and referenced via $env \u2014 direct $credentials expression references are not valid in n8n header expressions. continueOnFail is enabled so non-2xx responses produce an error item that step_12 can inspect rather than halting execution.",
+      "parameters": {
+        "url": "={{ $env.TECH_DIGEST_WEBHOOK_URL }}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ $json }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.TECH_DIGEST_WEBHOOK_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "output_shape": {
+        "statusCode": "HTTP response status code",
+        "body": "Webhook response body"
+      },
+      "error_handling": "continueOnFail: true ensures non-2xx responses are passed as error items to step_12 rather than throwing. Retry up to 3 times (top-level node settings); alert on final failure via step_13."
+    },
+    {
+      "id": "step_12",
+      "name": "Check Webhook Response is Success",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Validates that the webhook endpoint returned a 2xx HTTP status code. Because step_11 has continueOnFail enabled, non-2xx responses arrive here as items with a statusCode field (or error field) rather than throwing. Routes non-2xx responses to a notification step so permanent failures are observable.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch_true": "Webhook returned 2xx \u2014 delivery confirmed",
+        "branch_false": "Webhook returned non-2xx or error \u2014 route to alert"
+      },
+      "error_handling": "On evaluation error, treat as failure and route to alert step."
+    },
+    {
+      "id": "step_13",
+      "name": "Log Webhook Delivery Failure",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Sets an alert payload when the webhook delivery fails (non-2xx after retries). Downstream notification nodes (Slack, email, etc.) should be wired after this step in production deployments to surface the failure to operators.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b0",
+              "name": "alert",
+              "value": "Webhook delivery failed after retries. Check TECH_DIGEST_WEBHOOK_URL and TECH_DIGEST_WEBHOOK_TOKEN environment variables.",
+              "type": "string"
+            },
+            {
+              "id": "b1",
+              "name": "failedAt",
+              "value": "={{ new Date().toISOString() }}",
+              "type": "string"
+            },
+            {
+              "id": "b2",
+              "name": "statusCode",
+              "value": "={{ $json.statusCode ?? $json.error.httpCode ?? 0 }}",
+              "type": "number"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "alert": "Alert message string",
+        "failedAt": "ISO datetime string",
+        "statusCode": "HTTP status code that was returned, or 0 if connection-level error"
+      },
+      "error_handling": "Terminal logging step. Wire a Slack or email node after this step in production to surface failures to operators."
+    },
+    {
+      "id": "step_14",
+      "name": "Log Empty Feed Warning",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Sets a warning message when no feed items were collected, so the empty-result case is recorded.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "warning",
+              "value": "No feed items were collected from any source on this run.",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "collectedAt",
+              "value": "={{ new Date().toISOString() }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "totalItems",
+              "value": 0,
+              "type": "number"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "warning": "Warning message string",
+        "collectedAt": "ISO datetime string",
+        "totalItems": 0
+      },
+      "error_handling": "No additional error handling needed for logging."
+    }
+  ],
+  "gates": [
+    {
+      "after_step": "step_9b",
+      "pass_to": "step_10",
+      "fail_to": "step_9c",
+      "type": "conditional_branch",
+      "description": "If TECH_DIGEST_WEBHOOK_URL is configured and not a placeholder, proceed to empty-check; otherwise log misconfiguration and halt."
+    },
+    {
+      "after_step": "step_10",
+      "pass_to": "step_11",
+      "fail_to": "step_14",
+      "type": "conditional_branch",
+      "description": "If totalItems > 0 send webhook; otherwise log empty warning."
+    },
+    {
+      "after_step": "step_12",
+      "pass_to": null,
+      "fail_to": "step_13",
+      "type": "conditional_branch",
+      "description": "If webhook returned 2xx, workflow ends successfully; otherwise log delivery failure alert."
+    }
+  ],
+  "connections_notes": "Parallel fan-out: step_1 connects to step_2, step_4, and step_6 simultaneously. step_2 -> step_3; step_4 -> step_5; step_6 -> step_7. step_3 and step_5 feed into step_8a (Merge input 1 and input 2). step_8a and step_7 feed into step_8b (Merge input 1 and input 2). step_8b -> step_9 -> step_9b. Conditional branches as defined in gates array.",
+  "error_handling": {
+    "global_timeout_seconds": 300,
+    "global_timeout_notes": "Increased from 120s to 300s. With 3 feeds each retrying up to 3 times at 10s per-request timeout plus 2s waits, plus webhook retries, worst-case sequential time is approximately 3 * 3 * (10 + 2) = 108s for feeds plus ~36s for webhook retries = ~144s. 300s provides safe headroom. Feed fetches run in parallel so actual elapsed time is dominated by the slowest single feed branch.",
+    "on_workflow_failure": "Log error details; notify developer via email or Slack if configured. Non-critical workflow \u2014 no immediate escalation required."
+  },
+  "output": {
+    "destination": "Webhook endpoint configured via TECH_DIGEST_WEBHOOK_URL environment variable. Must be set before deployment \u2014 do not use the placeholder value.",
+    "format": "JSON POST body",
+    "description": "Structured JSON payload containing collectedAt timestamp, totalItems count, and a 'sources' object with TechCrunch, Hacker News, and The Verge arrays each holding {title, link} objects. Note: Hacker News links point to HN discussion pages, not original article URLs."
+  },
+  "security": {
+    "credentials_needed": [
+      "No authentication required for public RSS feeds.",
+      "Webhook endpoint URL: configure as n8n environment variable TECH_DIGEST_WEBHOOK_URL. Must not remain as the placeholder value \u2014 step_9b will block execution if it does.",
+      "Webhook Bearer token: configure as n8n environment variable TECH_DIGEST_WEBHOOK_TOKEN. Referenced in step_11 header as 'Authorization: Bearer {{ $env.TECH_DIGEST_WEBHOOK_TOKEN }}'. Note: $credentials expression references are not valid in n8n header value expressions; use $env for secrets that must appear inline. If the destination uses a different auth scheme (API key header, HMAC, etc.) adjust the header name and value accordingly.",
+      "If a richer credential management approach is needed, configure the HTTP Request node's built-in Authentication field using Generic Credential Type with Header Auth, and store the token there instead of via $env."
+    ],
+    "pii_handling": "No PII is collected or processed. All data is publicly available RSS feed content.",
+    "data_flow": "RSS XML fetched from public endpoints in parallel -> parsed in-memory -> merged (two sequential 2-input Merge nodes) -> aggregated -> validated (URL check, empty check) -> POSTed to webhook. No data is persisted by this workflow.",
+    "deduplication_note": "This workflow does not deduplicate items across weekly runs. RSS feeds are rolling windows and some articles from the previous Monday may still appear in the current week's feed. If deduplication is required, add an n8n Deduplicate Items node after step_8b keyed on the 'link' field, or persist seen URLs in n8n static data."
+  },
+  "cost_estimate": {
+    "per_run": "$0.00 \u2014 all nodes are native n8n nodes with no external API costs. RSS feeds are public and free. Webhook delivery cost depends on destination service.",
+    "monthly_estimate": "$0.00 assuming self-hosted or n8n Cloud plan already in use (4 runs/month on Monday schedule)."
+  },
+  "test_cases": [
+    {
+      "name": "Happy path - all three feeds return posts",
+      "input": {
+        "trigger": "Monday 7:00 AM cron",
+        "env_TECH_DIGEST_WEBHOOK_URL": "https://real-endpoint.example.com/tech-digest",
+        "env_TECH_DIGEST_WEBHOOK_TOKEN": "valid-token",
+        "techcrunch_feed": "Valid RSS XML with 15 items",
+        "hackernews_feed": "Valid RSS XML with 30 items",
+        "theverge_feed": "Valid Atom XML with 20 items using self-closing <link href=... /> tags"
+      },
+      "expected": {
+        "step_9b_branch": "true \u2014 URL configured",
+        "webhook_payload": {
+          "collectedAt": "any non-empty string",
+          "totalItems": 65,
+          "sources": {
+            "TechCrunch": "array of 15 objects each with title and link",
+            "Hacker News": "array of 30 objects each with title (HN discussion links)",
+            "The Verge": "array of 20 objects each with title and link"
+          }
+        },
+        "webhook_response_status": 200,
+        "step_12_branch": "true \u2014 delivery confirmed"
+      }
+    },
+    {
+      "name": "Edge case - one feed returns empty or no items",
+      "input": {
+        "trigger": "Monday 7:00 AM cron",
+        "env_TECH_DIGEST_WEBHOOK_URL": "https://real-endpoint.example.com/tech-digest",
+        "env_TECH_DIGEST_WEBHOOK_TOKEN": "valid-token",
+        "techcrunch_feed": "Valid RSS XML with 10 items",
+        "hackernews_feed": "RSS XML with 0 items (empty channel)",
+        "theverge_feed": "Valid Atom XML with 15 items"
+      },
+      "expected": {
+        "webhook_payload": {
+          "collectedAt": "any non-empty string",
+          "totalItems": 25,
+          "sources": {
+            "TechCrunch": "array of 10 objects",
+            "Hacker News": "empty array []",
+            "The Verge": "array of 15 objects"
+          }
+        },
+        "webhook_response_status": 200,
+        "step_12_branch": "true \u2014 delivery confirmed"
+      }
+    },
+    {
+      "name": "Error case - all feeds fail to return data",
+      "input": {
+        "trigger": "Monday 7:00 AM cron",
+        "env_TECH_DIGEST_WEBHOOK_URL": "https://real-endpoint.example.com/tech-digest",
+        "env_TECH_DIGEST_WEBHOOK_TOKEN": "valid-token",
+        "techcrunch_feed": "HTTP 503 error after 3 retries",
+        "hackernews_feed": "HTTP 503 error after 3 retries",
+        "theverge_feed": "HTTP 503 error after 3 retries"
+      },
+      "expected": {
+        "step_9b_branch": "true \u2014 URL configured",
+        "step_10_gate_result": "step_10 routes to step_14 (fail branch) because totalItems=0",
+        "warning_logged": "No feed items were collected from any source on this run.",
+        "totalItems": 0,
+        "webhook_called": false
+      }
+    },
+    {
+      "name": "Edge case - single feed returns malformed XML",
+      "input": {
+        "trigger": "Monday 7:00 AM cron",
+        "env_TECH_DIGEST_WEBHOOK_URL": "https://real-endpoint.example.com/tech-digest",
+        "env_TECH_DIGEST_WEBHOOK_TOKEN": "valid-token",
+        "techcrunch_feed": "Malformed/truncated XML",
+        "hackernews_feed": "Valid RSS XML with 20 items",
+        "theverge_feed": "Valid Atom XML with 15 items"
+      },
+      "expected": {
+        "techcrunch_items": "empty array (parse returns no results)",
+        "webhook_payload": {
+          "collectedAt": "any non-empty string",
+          "totalItems": 35,
+          "sources": {
+            "TechCrunch": "empty array []",
+            "Hacker News": "array of 20 objects",
+            "The Verge": "array of 15 objects"
+          }
+        },
+        "webhook_response_status": 200
+      }
+    },
+    {
+      "name": "Error case - webhook endpoint returns 401 Unauthorized",
+      "input": {
+        "trigger": "Monday 7:00 AM cron",
+        "env_TECH_DIGEST_WEBHOOK_URL": "https://real-endpoint.example.com/tech-digest",
+        "env_TECH_DIGEST_WEBHOOK_TOKEN": "invalid-token",
+        "techcrunch_feed": "Valid RSS XML with 10 items",
+        "hackernews_feed": "Valid RSS XML with 10 items",
+        "theverge_feed": "Valid Atom XML with 10 items",
+        "webhook_response": "HTTP 401 after 3 retries"
+      },
+      "expected": {
+        "step_11_attempts": 3,
+        "step_12_branch": "false \u2014 non-2xx status (step_11 continueOnFail passes 401 item to step_12)",
+        "step_13_output": {
+          "alert": "Webhook delivery failed after retries. Check TECH_DIGEST_WEBHOOK_URL and TECH_DIGEST_WEBHOOK_TOKEN environment variables.",
+          "statusCode": 401
+        },
+        "webhook_delivered": false
+      }
+    },
+    {
+      "name": "Edge case - CDATA-wrapped titles in TechCrunch feed",
+      "input": {
+        "trigger": "Monday 7:00 AM cron",
+        "env_TECH_DIGEST_WEBHOOK_URL": "https://real-endpoint.example.com/tech-digest",
+        "env_TECH_DIGEST_WEBHOOK_TOKEN": "valid-token",
+        "techcrunch_feed": "Valid RSS XML with 5 items where all titles use <![CDATA[...]]> wrapping",
+        "hackernews_feed": "Valid RSS XML with 5 items",
+        "theverge_feed": "Valid Atom XML with 5 items"
+      },
+      "expected": {
+        "techcrunch_items": "array of 5 objects with clean title strings (no CDATA artifacts)",
+        "webhook_payload": {
+          "totalItems": 15,
+          "sources": {
+            "TechCrunch": "array of 5 objects with clean titles"
+          }
+        },
+        "webhook_response_status": 200
+      }
+    },
+    {
+      "name": "Edge case - The Verge Atom feed with self-closing link tags",
+      "input": {
+        "trigger": "Monday 7:00 AM cron",
+        "env_TECH_DIGEST_WEBHOOK_URL": "https://real-endpoint.example.com/tech-digest",
+        "env_TECH_DIGEST_WEBHOOK_TOKEN": "valid-token",
+        "techcrunch_feed": "Valid RSS XML with 5 items",
+        "hackernews_feed": "Valid RSS XML with 5 items",
+        "theverge_feed": "Valid Atom XML with 10 entries each using <link rel=\"alternate\" href=\"https://...\" /> self-closing tags plus <link rel=\"self\" href=\"https://feed-url\"/> which should be skipped"
+      },
+      "expected": {
+        "theverge_items": "array of 10 objects with correct href links extracted (rel=self links skipped)",
+        "webhook_payload": {
+          "totalItems": 20,
+          "sources": {
+            "The Verge": "array of 10 objects each with non-empty link pointing to article (not feed self-link)"
+          }
+        },
+        "webhook_response_status": 200
+      }
+    },
+    {
+      "name": "Error case - TECH_DIGEST_WEBHOOK_URL not configured (placeholder value)",
+      "input": {
+        "trigger": "Monday 7:00 AM cron",
+        "env_TECH_DIGEST_WEBHOOK_URL": "https://your-webhook-endpoint.example.com/tech-digest",
+        "env_TECH_DIGEST_WEBHOOK_TOKEN": "some-token",
+        "techcrunch_feed": "Valid RSS XML with 10 items",
+        "hackernews_feed": "Valid RSS XML with 10 items",
+        "theverge_feed": "Valid Atom XML with 10 items"
+      },
+      "expected": {
+        "step_9b_branch": "false \u2014 URL is placeholder",
+        "step_9c_output": {
+          "alert": "TECH_DIGEST_WEBHOOK_URL is not configured or is still the placeholder value. Set this environment variable before deploying."
+        },
+        "webhook_called": false
+      }
+    },
+    {
+      "name": "Error case - TECH_DIGEST_WEBHOOK_URL environment variable is empty",
+      "input": {
+        "trigger": "Monday 7:00 AM cron",
+        "env_TECH_DIGEST_WEBHOOK_URL": "",
+        "env_TECH_DIGEST_WEBHOOK_TOKEN": "some-token",
+        "techcrunch_feed": "Valid RSS XML with 10 items",
+        "hackernews_feed": "Valid RSS XML with 10 items",
+        "theverge_feed": "Valid Atom XML with 10 items"
+      },
+      "expected": {
+        "step_9b_branch": "false \u2014 URL is empty",
+        "step_9c_output": {
+          "alert": "TECH_DIGEST_WEBHOOK_URL is not configured or is still the placeholder value. Set this environment variable before deploying."
+        },
+        "webhook_called": false
+      }
+    },
+    {
+      "name": "Edge case - TechCrunch feed contains Atom-style rel=hub and rel=self links that must be skipped",
+      "input": {
+        "trigger": "Monday 7:00 AM cron",
+        "env_TECH_DIGEST_WEBHOOK_URL": "https://real-endpoint.example.com/tech-digest",
+        "env_TECH_DIGEST_WEBHOOK_TOKEN": "valid-token",
+        "techcrunch_feed": "RSS XML where each <item> block contains a <link rel='hub' href='https://hub.example.com'/> and <link rel='self' href='https://feed.example.com'/> alongside the real article <link>https://article.example.com</link>",
+        "hackernews_feed": "Valid RSS XML with 5 items",
+        "theverge_feed": "Valid Atom XML with 5 items"
+      },
+      "expected": {
+        "techcrunch_items": "array of items with link pointing to article URL, not hub or self URLs",
+        "webhook_payload": {
+          "sources": {
+            "TechCrunch": "array of objects each with link = article URL (not feed hub or self-reference)"
+          }
+        },
+        "webhook_response_status": 200
+      }
+    }
+  ],
+  "components_used": [],
+  "components_needed": []
+}

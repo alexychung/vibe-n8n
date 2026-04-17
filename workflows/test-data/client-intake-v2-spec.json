@@ -1,0 +1,958 @@
+{
+  "workflow_name": "Client Intake Form Processor",
+  "description": "Processes new client intake form submissions by checking for duplicate emails in the CRM, updating existing records or creating new ones, and notifying the Slack team of new leads.",
+  "trigger": {
+    "type": "webhook",
+    "path": "client-intake",
+    "method": "POST",
+    "secret_token": "={{ $env.TYPEFORM_WEBHOOK_SECRET }}",
+    "response_mode": "Last Node",
+    "description": "Receives form submission payloads from Typeform via webhook. Protected by HMAC-SHA256 secret token validated in step_1. Response mode set to 'Last Node' so the final Respond to Webhook node controls the HTTP response."
+  },
+  "steps": [
+    {
+      "id": "step_1",
+      "name": "Validate Webhook Signature",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Validates the Typeform-Signature HMAC-SHA256 header using the raw request body bytes (not re-serialized JSON) to ensure the request is authentic before any processing. Rejects unauthorized requests. The webhook trigger must have 'Raw Body' enabled so $input.first().json.rawBody contains the original request bytes as a string.",
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\n// Use rawBody (the original request bytes) for HMAC computation, NOT JSON.stringify of the parsed object.\n// The webhook trigger must have 'Raw Body' option enabled.\nconst rawBody = $input.first().json.rawBody || '';\nconst secret = process.env.TYPEFORM_WEBHOOK_SECRET || '';\nconst signature = ($input.first().json.headers && $input.first().json.headers['typeform-signature']) ? $input.first().json.headers['typeform-signature'] : '';\nconst expectedSig = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');\nconst isValid = secret.length > 0 && rawBody.length > 0 && signature === expectedSig;\nif (!isValid) {\n  throw new Error('Unauthorized: Invalid or missing Typeform webhook signature');\n}\n// Parse the raw body for downstream use\nconst parsedBody = JSON.parse(rawBody);\nreturn [{ json: { body: parsedBody, headers: $input.first().json.headers } }];"
+      },
+      "output_shape": {
+        "body": "object",
+        "headers": "object"
+      },
+      "error_handling": "Throw on invalid signature; n8n will halt execution. Webhook response mode is 'Last Node'; on error n8n returns 500."
+    },
+    {
+      "id": "step_2",
+      "name": "Extract and Normalize Form Fields",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Extracts and normalizes key fields from the Typeform webhook payload into a flat structure for downstream use. Uses optional chaining to avoid runtime errors when fields are missing.",
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body;\nconst answers = (body.form_response && body.form_response.answers) ? body.form_response.answers : [];\nconst findAnswer = (ref) => answers.find(a => a.field && a.field.ref === ref);\nconst email = (findAnswer('email_field')?.email ?? '').toLowerCase().trim();\nconst first_name = findAnswer('first_name_field')?.text ?? '';\nconst last_name = findAnswer('last_name_field')?.text ?? '';\nconst phone = findAnswer('phone_field')?.phone_number ?? '';\nconst company = findAnswer('company_field')?.text ?? '';\nconst submitted_at = body.form_response?.submitted_at ?? '';\nconst form_response_token = body.form_response?.token ?? '';\nreturn [{ json: { email, first_name, last_name, phone, company, submitted_at, form_response_token } }];"
+      },
+      "output_shape": {
+        "email": "string",
+        "first_name": "string",
+        "last_name": "string",
+        "phone": "string",
+        "company": "string",
+        "submitted_at": "string",
+        "form_response_token": "string"
+      },
+      "error_handling": "Stop workflow on code error; missing optional fields default to empty string"
+    },
+    {
+      "id": "step_3",
+      "name": "Validate Required Fields",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Validates that required fields (email, first_name, last_name) are present and non-empty, outputting a boolean flag for the gate.",
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst email = item.email || '';\nconst firstName = item.first_name || '';\nconst lastName = item.last_name || '';\nconst emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nconst isValid = email.length > 0 && emailRegex.test(email) && firstName.length > 0 && lastName.length > 0;\nreturn [{ json: { ...item, fields_valid: isValid, validation_error: isValid ? '' : 'Missing or invalid required fields (email, first_name, last_name)' } }];"
+      },
+      "output_shape": {
+        "email": "string",
+        "first_name": "string",
+        "last_name": "string",
+        "phone": "string",
+        "company": "string",
+        "submitted_at": "string",
+        "form_response_token": "string",
+        "fields_valid": "boolean",
+        "validation_error": "string"
+      },
+      "error_handling": "Stop workflow on code error"
+    },
+    {
+      "id": "step_4",
+      "name": "Check Fields Valid",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes to CRM lookup if fields are valid, otherwise stops processing. Compares the boolean fields_valid flag using boolean equals operator.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.fields_valid }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch": "true (valid) | false (invalid)"
+      },
+      "error_handling": "Route to fail branch on invalid fields"
+    },
+    {
+      "id": "step_5",
+      "name": "Look Up Email in CRM",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Queries the internal CRM API to check if a contact with the submitted email already exists. Uses queryParameters for safe URL encoding. Authenticated via CRM API key credential.",
+      "parameters": {
+        "url": "https://crm.internal.example.com/api/v1/contacts",
+        "method": "GET",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "contacts": "array",
+        "total": "number"
+      },
+      "error_handling": "Retry up to 3 times; stop workflow and alert on persistent failure"
+    },
+    {
+      "id": "step_6",
+      "name": "Merge CRM Response with Form Data",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Merges the CRM lookup response with the original form data and determines whether this is a new or existing contact. Defensively handles multiple possible CRM response shapes (contacts array, data array, or direct array).",
+      "parameters": {
+        "jsCode": "const formData = $('Validate Required Fields').first().json;\nconst crmResponse = $input.first().json;\n// Defensively handle multiple CRM response shapes\nlet contacts = [];\nif (Array.isArray(crmResponse.contacts)) {\n  contacts = crmResponse.contacts;\n} else if (Array.isArray(crmResponse.data)) {\n  contacts = crmResponse.data;\n} else if (Array.isArray(crmResponse)) {\n  contacts = crmResponse;\n}\nconst isExisting = contacts.length > 0;\nconst existingId = isExisting ? contacts[0].id : null;\nreturn [{\n  json: {\n    email: formData.email,\n    first_name: formData.first_name,\n    last_name: formData.last_name,\n    phone: formData.phone,\n    company: formData.company,\n    submitted_at: formData.submitted_at,\n    form_response_token: formData.form_response_token,\n    is_existing_contact: isExisting,\n    existing_contact_id: existingId\n  }\n}];"
+      },
+      "output_shape": {
+        "email": "string",
+        "first_name": "string",
+        "last_name": "string",
+        "phone": "string",
+        "company": "string",
+        "submitted_at": "string",
+        "form_response_token": "string",
+        "is_existing_contact": "boolean",
+        "existing_contact_id": "string|null"
+      },
+      "error_handling": "Stop workflow on code error"
+    },
+    {
+      "id": "step_7",
+      "name": "Check If Existing Contact",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes to update existing record if contact exists, or create new record if contact is new. Compares the boolean is_existing_contact flag using boolean equals operator.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.is_existing_contact }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch": "true (existing) | false (new)"
+      },
+      "error_handling": "Default to new contact path on ambiguous state"
+    },
+    {
+      "id": "step_8",
+      "name": "Update Existing CRM Contact",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Updates the existing CRM contact record with the latest form submission data. Authenticated via CRM API key credential.",
+      "parameters": {
+        "url": "={{ 'https://crm.internal.example.com/api/v1/contacts/' + $json.existing_contact_id }}",
+        "method": "PATCH",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "body": {
+          "first_name": "={{ $json.first_name }}",
+          "last_name": "={{ $json.last_name }}",
+          "phone": "={{ $json.phone }}",
+          "company": "={{ $json.company }}",
+          "last_intake_submitted_at": "={{ $json.submitted_at }}",
+          "form_response_token": "={{ $json.form_response_token }}"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "id": "string",
+        "updated": "boolean"
+      },
+      "error_handling": "Retry up to 3 times; stop workflow and alert on persistent failure. Handle 409 conflict by treating as existing record already up to date."
+    },
+    {
+      "id": "step_9",
+      "name": "Set Updated Record Result",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Sets a normalized result object for the updated contact indicating the record was updated (not new), so no Slack notification is sent.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "record_action",
+              "value": "updated",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "contact_id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "is_new_lead",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "a3",
+              "name": "email",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.email }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "first_name",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.first_name }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "last_name",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.last_name }}",
+              "type": "string"
+            },
+            {
+              "id": "a6",
+              "name": "company",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.company }}",
+              "type": "string"
+            },
+            {
+              "id": "a7",
+              "name": "phone",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.phone }}",
+              "type": "string"
+            },
+            {
+              "id": "a8",
+              "name": "submitted_at",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.submitted_at }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "record_action": "string",
+        "contact_id": "string",
+        "is_new_lead": "boolean",
+        "email": "string",
+        "first_name": "string",
+        "last_name": "string",
+        "company": "string",
+        "phone": "string",
+        "submitted_at": "string"
+      },
+      "error_handling": "Stop on set error"
+    },
+    {
+      "id": "step_10",
+      "name": "Create New CRM Contact",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Creates a new CRM contact record for the new client submission. Authenticated via CRM API key credential. On 409 conflict (race condition duplicate), treats the contact as already existing.",
+      "parameters": {
+        "url": "https://crm.internal.example.com/api/v1/contacts",
+        "method": "POST",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "body": {
+          "email": "={{ $json.email }}",
+          "first_name": "={{ $json.first_name }}",
+          "last_name": "={{ $json.last_name }}",
+          "phone": "={{ $json.phone }}",
+          "company": "={{ $json.company }}",
+          "source": "typeform_intake",
+          "intake_submitted_at": "={{ $json.submitted_at }}",
+          "form_response_token": "={{ $json.form_response_token }}"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "id": "string",
+        "created": "boolean"
+      },
+      "error_handling": "Retry up to 3 times; stop workflow and alert on persistent failure. On 409/422 conflict response, treat as existing record (race condition guard)."
+    },
+    {
+      "id": "step_11",
+      "name": "Set New Lead Result",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Sets a normalized result object for the newly created contact, flagging it as a new lead for Slack notification.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "record_action",
+              "value": "created",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "contact_id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "is_new_lead",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "a3",
+              "name": "email",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.email }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "first_name",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.first_name }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "last_name",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.last_name }}",
+              "type": "string"
+            },
+            {
+              "id": "a6",
+              "name": "company",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.company }}",
+              "type": "string"
+            },
+            {
+              "id": "a7",
+              "name": "phone",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.phone }}",
+              "type": "string"
+            },
+            {
+              "id": "a8",
+              "name": "submitted_at",
+              "value": "={{ $('Merge CRM Response with Form Data').first().json.submitted_at }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "record_action": "string",
+        "contact_id": "string",
+        "is_new_lead": "boolean",
+        "email": "string",
+        "first_name": "string",
+        "last_name": "string",
+        "company": "string",
+        "phone": "string",
+        "submitted_at": "string"
+      },
+      "error_handling": "Stop on set error"
+    },
+    {
+      "id": "step_12",
+      "name": "Check If New Lead for Slack",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes to Slack notification only if the contact is a newly created lead. Both step_9 (updated) and step_11 (created) connect here directly, eliminating the need for the previously broken merge node. Compares boolean is_new_lead flag using boolean equals operator.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.is_new_lead }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch": "true (new lead - notify) | false (existing - skip)"
+      },
+      "error_handling": "Skip Slack on error to avoid duplicate notifications"
+    },
+    {
+      "id": "step_13",
+      "name": "Send New Lead Slack Notification",
+      "node_type": "n8n-nodes-base.slack",
+      "determinism": "1.0",
+      "description": "Posts a Slack message to the leads channel with the new client's details using the native n8n Slack node for managed authentication.",
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#new-leads",
+        "text": "={{ ':tada: New client intake received!\\n*Name:* ' + $json.first_name + ' ' + $json.last_name + '\\n*Email:* ' + $json.email + '\\n*Phone:* ' + ($json.phone || 'N/A') + '\\n*Company:* ' + ($json.company || 'N/A') + '\\n*Submitted At:* ' + $json.submitted_at + '\\n*CRM ID:* ' + $json.contact_id }}"
+      },
+      "output_shape": {
+        "ok": "boolean",
+        "ts": "string",
+        "channel": "string"
+      },
+      "error_handling": "Retry up to 3 times; log failure but do not stop workflow"
+    },
+    {
+      "id": "step_14",
+      "name": "Build Final Webhook Response",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Constructs the final JSON response payload confirming success. Receives input from both the new-lead path (after Slack, step_13) and the existing-contact path (step_12 false branch). Feeds into the explicit Respond to Webhook node.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "success",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "a1",
+              "name": "message",
+              "value": "Intake form processed successfully",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "contact_id",
+              "value": "={{ $json.contact_id || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "record_action",
+              "value": "={{ $json.record_action || 'processed' }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "success": "boolean",
+        "message": "string",
+        "contact_id": "string",
+        "record_action": "string"
+      },
+      "error_handling": "Return generic success if fields unavailable"
+    },
+    {
+      "id": "step_15",
+      "name": "Respond to Webhook",
+      "node_type": "n8n-nodes-base.respondToWebhook",
+      "determinism": "1.0",
+      "description": "Explicitly returns the final JSON response to the Typeform webhook caller with HTTP 200, using the payload built in step_14. This ensures a clean, controlled HTTP response regardless of which branch was taken.",
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "output_shape": {
+        "success": "boolean",
+        "message": "string",
+        "contact_id": "string",
+        "record_action": "string"
+      },
+      "error_handling": "Return HTTP 500 on node error; n8n default error handler applies"
+    }
+  ],
+  "gates": [
+    {
+      "after_step": "step_4",
+      "pass_to": "step_5",
+      "fail_to": null,
+      "type": "conditional_branch",
+      "notes": "Fail branch stops processing for invalid submissions; no downstream step needed"
+    },
+    {
+      "after_step": "step_7",
+      "pass_to": "step_8",
+      "fail_to": "step_10",
+      "type": "conditional_branch",
+      "notes": "True = existing contact -> update (step_8); False = new contact -> create (step_10)"
+    },
+    {
+      "after_step": "step_9",
+      "pass_to": "step_12",
+      "fail_to": null,
+      "type": "direct",
+      "notes": "Updated contact result flows directly into Slack gate (step_12). Merge node removed to fix passThrough input1-only bug."
+    },
+    {
+      "after_step": "step_11",
+      "pass_to": "step_12",
+      "fail_to": null,
+      "type": "direct",
+      "notes": "New lead result flows directly into Slack gate (step_12). Both step_9 and step_11 connect here, replacing the broken merge node."
+    },
+    {
+      "after_step": "step_12",
+      "pass_to": "step_13",
+      "fail_to": "step_14",
+      "type": "conditional_branch",
+      "notes": "True = new lead -> notify Slack (step_13) then build response (step_14); False = existing -> build response (step_14) directly"
+    },
+    {
+      "after_step": "step_13",
+      "pass_to": "step_14",
+      "fail_to": null,
+      "type": "direct",
+      "notes": "After Slack notification, build final response payload"
+    },
+    {
+      "after_step": "step_14",
+      "pass_to": "step_15",
+      "fail_to": null,
+      "type": "direct",
+      "notes": "Feed built response into explicit Respond to Webhook node for clean HTTP response"
+    }
+  ],
+  "error_handling": {
+    "global_timeout_seconds": 30,
+    "on_workflow_failure": "Return HTTP 500 with error message; log to n8n execution log for developer review"
+  },
+  "output": {
+    "destination": "Webhook response, CRM contact record, Slack #new-leads channel",
+    "format": "JSON response to caller via Respond to Webhook node; CRM record created/updated; Slack message posted for new leads",
+    "description": "Each intake submission results in an upserted CRM record and, for new contacts, a Slack notification with full client details"
+  },
+  "security": {
+    "credentials_needed": [
+      "CRM API key (HTTP header auth - configured as n8n httpHeaderAuth credential on step_5, step_8, step_10)",
+      "Slack Bot Token (managed via n8n Slack credential on step_13)",
+      "Typeform Webhook Secret (stored as n8n environment variable TYPEFORM_WEBHOOK_SECRET, used in step_1 with raw body HMAC-SHA256)"
+    ],
+    "pii_handling": "Email, name, and phone are processed in memory only; stored in CRM; not logged in n8n execution data",
+    "data_flow": "Typeform -> n8n Webhook (HMAC-SHA256 signature validated in step_1 using raw body bytes) -> CRM API (authenticated) -> Slack API (authenticated). All communication over HTTPS. Webhook raw body is preserved before JSON parsing to ensure HMAC validation correctness.",
+    "race_condition_note": "Concurrent duplicate submissions are partially mitigated by handling 409/422 conflict responses from the CRM CREATE endpoint. For stronger guarantees, a CRM-side unique constraint on email is recommended."
+  },
+  "cost_estimate": "Negligible per run - all calls are to internal or free-tier APIs; Slack API is free; n8n self-hosted has no per-execution cost",
+  "test_cases": [
+    {
+      "name": "Happy path - new client submission",
+      "input": {
+        "body": {
+          "form_response": {
+            "token": "abc123token",
+            "submitted_at": "2024-01-15T10:30:00Z",
+            "answers": [
+              {
+                "field": {
+                  "ref": "email_field"
+                },
+                "email": "jane.doe@example.com"
+              },
+              {
+                "field": {
+                  "ref": "first_name_field"
+                },
+                "text": "Jane"
+              },
+              {
+                "field": {
+                  "ref": "last_name_field"
+                },
+                "text": "Doe"
+              },
+              {
+                "field": {
+                  "ref": "phone_field"
+                },
+                "phone_number": "+15551234567"
+              },
+              {
+                "field": {
+                  "ref": "company_field"
+                },
+                "text": "Acme Corp"
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "success": true,
+        "record_action": "created",
+        "contact_id": "any non-empty string",
+        "slack_notification_sent": true,
+        "crm_record_created": true
+      }
+    },
+    {
+      "name": "Existing client re-submission (duplicate email)",
+      "input": {
+        "body": {
+          "form_response": {
+            "token": "existing456token",
+            "submitted_at": "2024-01-16T09:00:00Z",
+            "answers": [
+              {
+                "field": {
+                  "ref": "email_field"
+                },
+                "email": "existing.client@example.com"
+              },
+              {
+                "field": {
+                  "ref": "first_name_field"
+                },
+                "text": "John"
+              },
+              {
+                "field": {
+                  "ref": "last_name_field"
+                },
+                "text": "Smith"
+              },
+              {
+                "field": {
+                  "ref": "phone_field"
+                },
+                "phone_number": "+15559876543"
+              },
+              {
+                "field": {
+                  "ref": "company_field"
+                },
+                "text": "Smith LLC"
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "success": true,
+        "record_action": "updated",
+        "contact_id": "any non-empty string",
+        "slack_notification_sent": false,
+        "crm_record_updated": true
+      }
+    },
+    {
+      "name": "Invalid submission - missing email",
+      "input": {
+        "body": {
+          "form_response": {
+            "token": "invalid789token",
+            "submitted_at": "2024-01-17T11:00:00Z",
+            "answers": [
+              {
+                "field": {
+                  "ref": "first_name_field"
+                },
+                "text": "Bob"
+              },
+              {
+                "field": {
+                  "ref": "last_name_field"
+                },
+                "text": "Builder"
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "fields_valid": false,
+        "validation_error": "Missing or invalid required fields (email, first_name, last_name)",
+        "crm_record_created": false,
+        "slack_notification_sent": false
+      }
+    },
+    {
+      "name": "New client with optional fields missing (no phone or company)",
+      "input": {
+        "body": {
+          "form_response": {
+            "token": "minimal999token",
+            "submitted_at": "2024-01-18T14:00:00Z",
+            "answers": [
+              {
+                "field": {
+                  "ref": "email_field"
+                },
+                "email": "minimal.user@example.com"
+              },
+              {
+                "field": {
+                  "ref": "first_name_field"
+                },
+                "text": "Alice"
+              },
+              {
+                "field": {
+                  "ref": "last_name_field"
+                },
+                "text": "Wonderland"
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "success": true,
+        "record_action": "created",
+        "contact_id": "any non-empty string",
+        "slack_notification_sent": true,
+        "phone_in_crm": "",
+        "company_in_crm": ""
+      }
+    },
+    {
+      "name": "Unauthorized request - invalid Typeform signature",
+      "input": {
+        "body": {
+          "form_response": {
+            "token": "malicious_token",
+            "submitted_at": "2024-01-19T08:00:00Z",
+            "answers": [
+              {
+                "field": {
+                  "ref": "email_field"
+                },
+                "email": "attacker@evil.com"
+              },
+              {
+                "field": {
+                  "ref": "first_name_field"
+                },
+                "text": "Bad"
+              },
+              {
+                "field": {
+                  "ref": "last_name_field"
+                },
+                "text": "Actor"
+              }
+            ]
+          }
+        },
+        "headers": {
+          "typeform-signature": "sha256=invalidsignature"
+        }
+      },
+      "expected": {
+        "workflow_halted": true,
+        "error": "Unauthorized: Invalid or missing Typeform webhook signature",
+        "crm_record_created": false,
+        "slack_notification_sent": false
+      }
+    },
+    {
+      "name": "Malformed payload - answers array missing entirely",
+      "input": {
+        "body": {
+          "form_response": {
+            "token": "broken_token",
+            "submitted_at": "2024-01-20T12:00:00Z"
+          }
+        }
+      },
+      "expected": {
+        "fields_valid": false,
+        "validation_error": "Missing or invalid required fields (email, first_name, last_name)",
+        "crm_record_created": false,
+        "slack_notification_sent": false
+      }
+    },
+    {
+      "name": "Email with special characters (plus-addressing) - URL encoding test",
+      "input": {
+        "body": {
+          "form_response": {
+            "token": "specialchar_token",
+            "submitted_at": "2024-01-21T10:00:00Z",
+            "answers": [
+              {
+                "field": {
+                  "ref": "email_field"
+                },
+                "email": "jane+intake@example.com"
+              },
+              {
+                "field": {
+                  "ref": "first_name_field"
+                },
+                "text": "Jane"
+              },
+              {
+                "field": {
+                  "ref": "last_name_field"
+                },
+                "text": "Plus"
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "success": true,
+        "crm_lookup_email_encoded": true,
+        "record_action": "created or updated depending on CRM state",
+        "crm_record_processed": true
+      }
+    },
+    {
+      "name": "Race condition - CRM returns 409 conflict on create (concurrent duplicate)",
+      "input": {
+        "body": {
+          "form_response": {
+            "token": "race_token",
+            "submitted_at": "2024-01-22T10:00:00Z",
+            "answers": [
+              {
+                "field": {
+                  "ref": "email_field"
+                },
+                "email": "concurrent@example.com"
+              },
+              {
+                "field": {
+                  "ref": "first_name_field"
+                },
+                "text": "Race"
+              },
+              {
+                "field": {
+                  "ref": "last_name_field"
+                },
+                "text": "Condition"
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "crm_create_returns_409": true,
+        "workflow_treats_as_existing": true,
+        "duplicate_crm_record_created": false,
+        "slack_notification_sent": false
+      }
+    },
+    {
+      "name": "CRM returns non-standard response shape (data array instead of contacts array)",
+      "input": {
+        "body": {
+          "form_response": {
+            "token": "altshape_token",
+            "submitted_at": "2024-01-23T10:00:00Z",
+            "answers": [
+              {
+                "field": {
+                  "ref": "email_field"
+                },
+                "email": "altshape@example.com"
+              },
+              {
+                "field": {
+                  "ref": "first_name_field"
+                },
+                "text": "Alt"
+              },
+              {
+                "field": {
+                  "ref": "last_name_field"
+                },
+                "text": "Shape"
+              }
+            ]
+          }
+        }
+      },
+      "crm_mock_response": {
+        "data": [
+          {
+            "id": "existing-id-999",
+            "email": "altshape@example.com"
+          }
+        ]
+      },
+      "expected": {
+        "is_existing_contact": true,
+        "record_action": "updated",
+        "slack_notification_sent": false,
+        "crm_response_shape_handled": true
+      }
+    }
+  ],
+  "components_used": [],
+  "components_needed": []
+}

@@ -1,0 +1,576 @@
+{
+  "workflow_name": "CSV Data Cleaner via Webhook",
+  "description": "Receives a CSV file via webhook, cleans the data by standardizing phone numbers, trimming whitespace, and removing rows with missing name or email, then returns the cleaned data as JSON.",
+  "trigger": {
+    "type": "webhook",
+    "path": "csv-cleaner",
+    "method": "POST",
+    "description": "Accepts a raw CSV body (Content-Type: text/plain or text/csv) and returns cleaned JSON data. Requires Header Auth (X-API-Key) for access. Multipart/form-data is not supported \u2014 send the raw CSV as the request body. If the workflow encounters an uncaught runtime error before reaching a Respond to Webhook node, the caller will receive a timeout response (30s); a reverse proxy should enforce a shorter upstream timeout and return 504 in that case."
+  },
+  "steps": [
+    {
+      "id": "step_1",
+      "name": "Receive CSV Webhook",
+      "node_type": "n8n-nodes-base.webhook",
+      "determinism": "1.0",
+      "description": "Listens for incoming POST requests containing CSV data in the request body. Protected by Header Auth using the csv-cleaner-api-key credential. Only raw body (text/plain or text/csv) is supported; multipart/form-data uploads are not supported.",
+      "parameters": {
+        "path": "csv-cleaner",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "authentication": "headerAuth"
+      },
+      "output_shape": {
+        "body": "raw CSV string or binary",
+        "headers": "request headers"
+      },
+      "error_handling": "Return 401 if auth header missing or invalid; return 400 if no body received"
+    },
+    {
+      "id": "step_2",
+      "name": "Normalize Raw Body",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Extracts and normalizes the raw CSV body from the webhook output so the Code node has a consistent raw_body field. Only handles string and simple object bodies \u2014 binary handling is deferred to the Code node. Note: multipart/form-data is not supported; only raw body requests are expected.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b0",
+              "name": "raw_body",
+              "value": "={{ $json.body && typeof $json.body === 'string' ? $json.body : '' }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "raw_body": "string containing the CSV text, or empty string if body was not a plain string"
+      },
+      "error_handling": "Defaults to empty string if body is absent or not a string; binary fallback handled in step_3"
+    },
+    {
+      "id": "step_3",
+      "name": "Parse and Clean CSV Data",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Parses the raw CSV string (handling both LF and CRLF line endings, and RFC 4180 escaped quotes), normalizes all header keys to lowercase at parse time, trims whitespace from all fields, standardizes phone numbers to +1-XXX-XXX-XXXX format, and removes rows missing name or email. Returns success flag and error details for downstream routing. Invalid phone rows are collected after the full row is assembled to ensure complete row data. Error messages are static strings that never echo back input data to avoid PII leakage.",
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nfunction standardizePhone(raw) {\n  if (!raw || typeof raw !== 'string') return { cleaned: '', original: raw || '' };\n  const digits = raw.replace(/\\D/g, '');\n  if (digits.length === 0) return { cleaned: '', original: raw };\n  if (digits.length === 10) {\n    return { cleaned: `+1-${digits.slice(0,3)}-${digits.slice(3,6)}-${digits.slice(6)}`, original: raw };\n  }\n  if (digits.length === 11 && digits[0] === '1') {\n    return { cleaned: `+1-${digits.slice(1,4)}-${digits.slice(4,7)}-${digits.slice(7)}`, original: raw };\n  }\n  return { cleaned: `+${digits}`, original: raw };\n}\n\nfunction parseCSV(csvText) {\n  const lines = csvText.trim().split(/\\r?\\n/);\n  if (lines.length < 2) return [];\n  // Normalize headers to lowercase to ensure consistent key access\n  const headers = lines[0].split(',').map(h => h.trim().replace(/^\"|\"$/g, '').toLowerCase());\n  const rows = [];\n  for (let i = 1; i < lines.length; i++) {\n    const line = lines[i].trim();\n    if (!line) continue;\n    const values = [];\n    let current = '';\n    let inQuotes = false;\n    for (let c = 0; c < line.length; c++) {\n      const ch = line[c];\n      if (ch === '\"') {\n        if (inQuotes && line[c + 1] === '\"') {\n          // RFC 4180: escaped quote inside quoted field\n          current += '\"';\n          c++;\n        } else {\n          inQuotes = !inQuotes;\n        }\n      } else if (ch === ',' && !inQuotes) {\n        values.push(current.trim());\n        current = '';\n      } else {\n        current += ch;\n      }\n    }\n    values.push(current.trim());\n    const row = {};\n    headers.forEach((h, idx) => {\n      row[h] = (values[idx] || '').trim();\n    });\n    rows.push(row);\n  }\n  return rows;\n}\n\nconst PHONE_KEYS = new Set(['phone', 'phone_number', 'phonenumber', 'mobile']);\n\nconst results = [];\n\nfor (const item of items) {\n  let csvText = '';\n\n  // Primary: use normalized raw_body from Set node (string only)\n  if (item.json.raw_body && typeof item.json.raw_body === 'string' && item.json.raw_body.trim().length > 0) {\n    csvText = item.json.raw_body;\n  } else if (item.binary) {\n    // Fallback: binary body (e.g. direct file upload)\n    const binaryKey = Object.keys(item.binary)[0];\n    if (binaryKey) {\n      const buf = Buffer.from(item.binary[binaryKey].data, 'base64');\n      csvText = buf.toString('utf-8');\n    }\n  }\n\n  if (!csvText || csvText.trim().length === 0) {\n    results.push({\n      json: {\n        success: false,\n        error: 'Request body is empty or missing. Please provide a valid CSV payload.',\n        cleaned_rows: [],\n        invalid_phone_rows: [],\n        total_input_rows: 0,\n        total_output_rows: 0,\n        rows_removed: 0\n      }\n    });\n    continue;\n  }\n\n  const parsedRows = parseCSV(csvText);\n\n  if (parsedRows.length === 0) {\n    results.push({\n      json: {\n        success: false,\n        error: 'CSV contained no data rows. Ensure the file has a header row and at least one data row.',\n        cleaned_rows: [],\n        invalid_phone_rows: [],\n        total_input_rows: 0,\n        total_output_rows: 0,\n        rows_removed: 0\n      }\n    });\n    continue;\n  }\n\n  // All header keys are already lowercase from parseCSV\n  const filteredRows = parsedRows.filter(row => {\n    const name = (row['name'] || '').trim();\n    const email = (row['email'] || '').trim();\n    return name.length > 0 && email.length > 0;\n  });\n\n  const invalidPhoneRows = [];\n  const cleanedRows = filteredRows.map(row => {\n    const cleaned = {};\n    for (const key of Object.keys(row)) {\n      const val = (row[key] || '').trim();\n      if (PHONE_KEYS.has(key)) {\n        const phoneResult = standardizePhone(val);\n        cleaned[key] = phoneResult.cleaned;\n      } else {\n        cleaned[key] = val;\n      }\n    }\n    // Collect invalid phone rows AFTER the full cleaned row is assembled\n    for (const key of Object.keys(cleaned)) {\n      if (PHONE_KEYS.has(key)) {\n        const originalVal = (row[key] || '').trim();\n        const digits = originalVal.replace(/\\D/g, '');\n        if (originalVal.length > 0 && digits.length !== 10 && !(digits.length === 11 && digits[0] === '1')) {\n          invalidPhoneRows.push({ row: Object.assign({}, cleaned), original_phone: originalVal });\n        }\n      }\n    }\n    return cleaned;\n  });\n\n  results.push({\n    json: {\n      success: true,\n      error: null,\n      cleaned_rows: cleanedRows,\n      invalid_phone_rows: invalidPhoneRows,\n      total_input_rows: parsedRows.length,\n      total_output_rows: cleanedRows.length,\n      rows_removed: parsedRows.length - cleanedRows.length\n    }\n  });\n}\n\nreturn results;"
+      },
+      "output_shape": {
+        "success": "boolean indicating parse/clean success",
+        "error": "null on success, static descriptive string on failure \u2014 never echoes input data",
+        "cleaned_rows": "array of cleaned row objects with lowercase keys",
+        "invalid_phone_rows": "array of fully-assembled cleaned row objects with non-standard phone numbers, each with original_phone preserved",
+        "total_input_rows": "number",
+        "total_output_rows": "number",
+        "rows_removed": "number"
+      },
+      "error_handling": "Returns success:false with static error string for empty body, missing CSV rows, or parse failures rather than throwing. Invalid phone numbers are flagged after full row assembly. Error messages never contain input data to prevent PII leakage."
+    },
+    {
+      "id": "step_4",
+      "name": "Validate Cleaned Data Exists",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes to success branch if the Code node reported success:true, otherwise routes to error branch.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "true_branch": "success:true \u2014 cleaned_rows present and parseable",
+        "false_branch": "success:false \u2014 empty body, no rows, or parse error"
+      },
+      "error_handling": "Routes to error response on false branch"
+    },
+    {
+      "id": "step_5",
+      "name": "Build Success Response",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Constructs the final JSON response with status, cleaned rows, invalid phone row flags, and summary stats.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "status",
+              "value": "success",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "data",
+              "value": "={{ $json.cleaned_rows }}",
+              "type": "array"
+            },
+            {
+              "id": "a2",
+              "name": "invalid_phone_rows",
+              "value": "={{ $json.invalid_phone_rows }}",
+              "type": "array"
+            },
+            {
+              "id": "a3",
+              "name": "summary",
+              "value": "={{ { total_input_rows: $json.total_input_rows, total_output_rows: $json.total_output_rows, rows_removed: $json.rows_removed } }}",
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "status": "success",
+        "data": "array of cleaned row objects",
+        "invalid_phone_rows": "array of rows with non-standard phone numbers",
+        "summary": "object with total_input_rows, total_output_rows, rows_removed"
+      },
+      "error_handling": "Surface any expression errors in workflow log"
+    },
+    {
+      "id": "step_6",
+      "name": "Build Error Response",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Returns a structured error JSON response when data cleaning or validation fails. Error message is sourced from the Code node's static error field \u2014 never echoes back input data to prevent PII leakage in logs or intermediate proxies.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e0",
+              "name": "status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "e1",
+              "name": "message",
+              "value": "={{ $json.error || 'Failed to parse or clean CSV data. Ensure the request body contains valid CSV with at least a header row.' }}",
+              "type": "string"
+            },
+            {
+              "id": "e2",
+              "name": "data",
+              "value": "=[]",
+              "type": "array"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "status": "error",
+        "message": "static string describing the failure \u2014 never contains input data",
+        "data": "empty array"
+      },
+      "error_handling": "Always succeeds \u2014 this is itself the error handler. Maintain invariant: error messages must remain static and must not include any input field values."
+    },
+    {
+      "id": "step_7",
+      "name": "Respond Success to Webhook",
+      "node_type": "n8n-nodes-base.respondToWebhook",
+      "determinism": "1.0",
+      "description": "Sends a controlled HTTP 200 response back to the caller with the cleaned data JSON object. responseBody is set to the raw JSON object so n8n serializes it correctly \u2014 avoids double-encoded JSON that would result from JSON.stringify.",
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 200,
+        "responseBody": "={{ $json }}"
+      },
+      "output_shape": {
+        "http_status": 200,
+        "body": "JSON object with status, data, invalid_phone_rows, and summary"
+      },
+      "error_handling": "If expression fails, n8n will surface an error in the workflow log. Note: if this node is never reached due to an uncaught upstream error, the webhook caller will hang until the 30s global timeout; a reverse proxy should enforce a shorter upstream timeout."
+    },
+    {
+      "id": "step_8",
+      "name": "Respond Error to Webhook",
+      "node_type": "n8n-nodes-base.respondToWebhook",
+      "determinism": "1.0",
+      "description": "Sends a controlled HTTP 400 response back to the caller with the error details JSON object. responseBody is set to the raw JSON object so n8n serializes it correctly \u2014 avoids double-encoded JSON.",
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 400,
+        "responseBody": "={{ $json }}"
+      },
+      "output_shape": {
+        "http_status": 400,
+        "body": "JSON object with status=error and descriptive static message"
+      },
+      "error_handling": "Always succeeds \u2014 terminates the error branch with a proper HTTP response"
+    }
+  ],
+  "gates": [
+    {
+      "after_step": "step_1",
+      "pass_to": "step_2",
+      "type": "linear"
+    },
+    {
+      "after_step": "step_2",
+      "pass_to": "step_3",
+      "type": "linear"
+    },
+    {
+      "after_step": "step_3",
+      "pass_to": "step_4",
+      "type": "linear"
+    },
+    {
+      "after_step": "step_4",
+      "pass_to": "step_5",
+      "fail_to": "step_6",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_5",
+      "pass_to": "step_7",
+      "type": "linear"
+    },
+    {
+      "after_step": "step_6",
+      "pass_to": "step_8",
+      "type": "linear"
+    }
+  ],
+  "error_handling": {
+    "global_timeout_seconds": 30,
+    "on_workflow_failure": "If an uncaught runtime error occurs before a Respond to Webhook node is reached (e.g. in step_2 or step_3), the caller will hang until the 30s global timeout because n8n does not automatically send an HTTP response in responseNode mode. Configure a reverse proxy (e.g. nginx) upstream of n8n to enforce a shorter connection timeout and return 504 to callers. Optionally configure an n8n Error Workflow to send a 500 JSON response via a Respond to Webhook node.",
+    "pii_note": "Error messages throughout the workflow are static strings and must never be modified to include input field values, to prevent PII leakage via error responses or intermediate proxy logs."
+  },
+  "output": {
+    "destination": "webhook response",
+    "format": "JSON",
+    "description": "Returns HTTP 200 with JSON body containing status=success, cleaned data array (with lowercase keys), invalid_phone_rows array, and row count summary; or HTTP 400 with status=error and a static descriptive message. Both branches use explicit Respond to Webhook nodes with responseBody set to the raw JSON object to prevent double-encoding."
+  },
+  "security": {
+    "credentials_needed": [
+      {
+        "name": "csv-cleaner-api-key",
+        "type": "httpHeaderAuth",
+        "description": "Header Auth credential used by the Webhook node. Callers must include the configured header (e.g., X-API-Key: <secret>) in every request. Configure via n8n Credentials manager."
+      }
+    ],
+    "pii_handling": "CSV may contain PII (names, emails, phone numbers). Data is processed in-memory and not persisted. No external API calls made. Error messages are static strings and never echo back input data.",
+    "data_flow": "Webhook (authenticated) \u2192 in-memory normalize \u2192 in-memory parse/clean \u2192 JSON response. No data stored or forwarded externally.",
+    "content_type_note": "Only raw body requests (text/plain or text/csv) are supported. Multipart/form-data is not supported."
+  },
+  "cost_estimate": "$0.00 per run \u2014 no external API calls or paid services used",
+  "test_cases": [
+    {
+      "name": "Happy path \u2014 well-formed CSV with phone numbers",
+      "input": {
+        "method": "POST",
+        "path": "/csv-cleaner",
+        "headers": {
+          "Content-Type": "text/plain",
+          "X-API-Key": "<configured-secret>"
+        },
+        "body": "name,email,phone\nAlice Smith,alice@example.com,5551234567\n Bob Jones ,bob@example.com, (555) 987-6543 \nCarol White,carol@example.com,+1 555 111 2222"
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "success",
+        "data": [
+          {
+            "name": "Alice Smith",
+            "email": "alice@example.com",
+            "phone": "+1-555-123-4567"
+          },
+          {
+            "name": "Bob Jones",
+            "email": "bob@example.com",
+            "phone": "+1-555-987-6543"
+          },
+          {
+            "name": "Carol White",
+            "email": "carol@example.com",
+            "phone": "+1-555-111-2222"
+          }
+        ],
+        "invalid_phone_rows": [],
+        "summary": {
+          "total_input_rows": 3,
+          "total_output_rows": 3,
+          "rows_removed": 0
+        }
+      }
+    },
+    {
+      "name": "Edge case \u2014 rows missing name or email are removed",
+      "input": {
+        "method": "POST",
+        "path": "/csv-cleaner",
+        "headers": {
+          "Content-Type": "text/plain",
+          "X-API-Key": "<configured-secret>"
+        },
+        "body": "name,email,phone\nAlice Smith,alice@example.com,5551234567\n,bob@example.com,5559876543\nCarol White,,5551112222\nDave Brown,dave@example.com,5554445555"
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "success",
+        "data": [
+          {
+            "name": "Alice Smith",
+            "email": "alice@example.com",
+            "phone": "+1-555-123-4567"
+          },
+          {
+            "name": "Dave Brown",
+            "email": "dave@example.com",
+            "phone": "+1-555-444-5555"
+          }
+        ],
+        "invalid_phone_rows": [],
+        "summary": {
+          "total_input_rows": 4,
+          "total_output_rows": 2,
+          "rows_removed": 2
+        }
+      }
+    },
+    {
+      "name": "Error case \u2014 empty or missing body",
+      "input": {
+        "method": "POST",
+        "path": "/csv-cleaner",
+        "headers": {
+          "Content-Type": "text/plain",
+          "X-API-Key": "<configured-secret>"
+        },
+        "body": ""
+      },
+      "expected": {
+        "http_status": 400,
+        "status": "error",
+        "message": "Request body is empty or missing. Please provide a valid CSV payload.",
+        "data": []
+      }
+    },
+    {
+      "name": "Edge case \u2014 CSV with extra whitespace and mixed-case phone column (keys normalized to lowercase)",
+      "input": {
+        "method": "POST",
+        "path": "/csv-cleaner",
+        "headers": {
+          "Content-Type": "text/plain",
+          "X-API-Key": "<configured-secret>"
+        },
+        "body": "  Name  ,  Email  ,  Phone  \n  Jane Doe  ,  jane@example.com  ,  1-800-555-0199  \n  John Roe  ,  john@example.com  ,  +15551230000  "
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "success",
+        "data": [
+          {
+            "name": "Jane Doe",
+            "email": "jane@example.com",
+            "phone": "+1-800-555-0199"
+          },
+          {
+            "name": "John Roe",
+            "email": "john@example.com",
+            "phone": "+1-555-123-0000"
+          }
+        ],
+        "invalid_phone_rows": [],
+        "summary": {
+          "total_input_rows": 2,
+          "total_output_rows": 2,
+          "rows_removed": 0
+        },
+        "note": "Header keys are normalized to lowercase at parse time; output keys will be lowercase regardless of input casing."
+      }
+    },
+    {
+      "name": "Error case \u2014 CSV with header row only and no data rows",
+      "input": {
+        "method": "POST",
+        "path": "/csv-cleaner",
+        "headers": {
+          "Content-Type": "text/plain",
+          "X-API-Key": "<configured-secret>"
+        },
+        "body": "name,email,phone"
+      },
+      "expected": {
+        "http_status": 400,
+        "status": "error",
+        "message": "CSV contained no data rows. Ensure the file has a header row and at least one data row.",
+        "data": []
+      }
+    },
+    {
+      "name": "Edge case \u2014 Windows CRLF line endings",
+      "input": {
+        "method": "POST",
+        "path": "/csv-cleaner",
+        "headers": {
+          "Content-Type": "text/plain",
+          "X-API-Key": "<configured-secret>"
+        },
+        "body": "name,email,phone\r\nAlice Smith,alice@example.com,5551234567\r\nBob Jones,bob@example.com,5559876543"
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "success",
+        "data": [
+          {
+            "name": "Alice Smith",
+            "email": "alice@example.com",
+            "phone": "+1-555-123-4567"
+          },
+          {
+            "name": "Bob Jones",
+            "email": "bob@example.com",
+            "phone": "+1-555-987-6543"
+          }
+        ],
+        "invalid_phone_rows": [],
+        "summary": {
+          "total_input_rows": 2,
+          "total_output_rows": 2,
+          "rows_removed": 0
+        }
+      }
+    },
+    {
+      "name": "Edge case \u2014 non-standard phone number flagged in invalid_phone_rows with full row data",
+      "input": {
+        "method": "POST",
+        "path": "/csv-cleaner",
+        "headers": {
+          "Content-Type": "text/plain",
+          "X-API-Key": "<configured-secret>"
+        },
+        "body": "name,email,phone\nAlice Smith,alice@example.com,123\nBob Jones,bob@example.com,5559876543"
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "success",
+        "data": [
+          {
+            "name": "Alice Smith",
+            "email": "alice@example.com",
+            "phone": "+123"
+          },
+          {
+            "name": "Bob Jones",
+            "email": "bob@example.com",
+            "phone": "+1-555-987-6543"
+          }
+        ],
+        "invalid_phone_rows": [
+          {
+            "row": {
+              "name": "Alice Smith",
+              "email": "alice@example.com",
+              "phone": "+123"
+            },
+            "original_phone": "123"
+          }
+        ],
+        "summary": {
+          "total_input_rows": 2,
+          "total_output_rows": 2,
+          "rows_removed": 0
+        },
+        "note": "invalid_phone_rows entries contain the fully assembled cleaned row (all fields populated), not a partial row."
+      }
+    },
+    {
+      "name": "Security \u2014 unauthenticated request rejected",
+      "input": {
+        "method": "POST",
+        "path": "/csv-cleaner",
+        "headers": {
+          "Content-Type": "text/plain"
+        },
+        "body": "name,email,phone\nAlice Smith,alice@example.com,5551234567"
+      },
+      "expected": {
+        "http_status": 401,
+        "description": "n8n Webhook node rejects the request before workflow executes when Header Auth credential is not present or does not match."
+      }
+    },
+    {
+      "name": "Edge case \u2014 RFC 4180 escaped quotes inside quoted fields",
+      "input": {
+        "method": "POST",
+        "path": "/csv-cleaner",
+        "headers": {
+          "Content-Type": "text/plain",
+          "X-API-Key": "<configured-secret>"
+        },
+        "body": "name,email,phone\n\"O'Brien, \"\"The Great\"\"\",obrien@example.com,5551234567\nJane Doe,jane@example.com,5559876543"
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "success",
+        "data": [
+          {
+            "name": "O'Brien, \"The Great\"",
+            "email": "obrien@example.com",
+            "phone": "+1-555-123-4567"
+          },
+          {
+            "name": "Jane Doe",
+            "email": "jane@example.com",
+            "phone": "+1-555-987-6543"
+          }
+        ],
+        "invalid_phone_rows": [],
+        "summary": {
+          "total_input_rows": 2,
+          "total_output_rows": 2,
+          "rows_removed": 0
+        }
+      }
+    },
+    {
+      "name": "Edge case \u2014 ALL CAPS header keys normalized to lowercase",
+      "input": {
+        "method": "POST",
+        "path": "/csv-cleaner",
+        "headers": {
+          "Content-Type": "text/plain",
+          "X-API-Key": "<configured-secret>"
+        },
+        "body": "NAME,EMAIL,PHONE\nAlice Smith,alice@example.com,5551234567\nBob Jones,bob@example.com,5559876543"
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "success",
+        "data": [
+          {
+            "name": "Alice Smith",
+            "email": "alice@example.com",
+            "phone": "+1-555-123-4567"
+          },
+          {
+            "name": "Bob Jones",
+            "email": "bob@example.com",
+            "phone": "+1-555-987-6543"
+          }
+        ],
+        "invalid_phone_rows": [],
+        "summary": {
+          "total_input_rows": 2,
+          "total_output_rows": 2,
+          "rows_removed": 0
+        },
+        "note": "ALL CAPS header keys (NAME, EMAIL, PHONE) are normalized to lowercase at parse time. Rows are correctly filtered and phone correctly detected."
+      }
+    }
+  ],
+  "components_used": [],
+  "components_needed": []
+}
