@@ -20,6 +20,7 @@ from test_runner import run_tests, render_results
 from auditor import audit_workflow, render_findings
 from harden import harden
 from deploy import deploy
+from export import export_workflow
 from status import BuildStatus
 
 
@@ -54,8 +55,13 @@ def load_spec(spec_path: str):
     return parse_spec(raw)
 
 
-def cmd_build(spec_path: str, dry_run: bool = False):
-    """Full build pipeline: SCAFFOLD → WIRE → TEST → AUDIT → HARDEN → CODIFY → DEPLOY."""
+def cmd_build(
+    spec_path: str,
+    dry_run: bool = False,
+    export: bool = True,
+    export_dir: str = 'workflows/live',
+):
+    """Full build pipeline: SCAFFOLD → WIRE → TEST → AUDIT → HARDEN → CODIFY → DEPLOY → EXPORT."""
     spec = load_spec(spec_path)
     status = BuildStatus(spec.workflow_name)
 
@@ -151,6 +157,21 @@ def cmd_build(spec_path: str, dry_run: bool = False):
         print(status.render())
         print()
 
+        # EXPORT
+        if export:
+            try:
+                result = export_workflow(spec, client, workflow_id, output_dir=export_dir)
+                status.done(
+                    'EXPORT',
+                    f"{result['json_path']} + README ({result['node_count']} nodes)",
+                )
+            except Exception as e:
+                status.fail('EXPORT', f'{type(e).__name__}: {e}')
+        else:
+            status.skip('EXPORT', '--no-export')
+        print(status.render())
+        print()
+
         print(f'Workflow deployed: {workflow_id}')
         return 0
 
@@ -206,7 +227,14 @@ def main():
     try:
         if command == 'build':
             dry_run = '--dry-run' in flags
-            return cmd_build(spec_path, dry_run=dry_run)
+            export = '--no-export' not in flags
+            export_dir = 'workflows/live'
+            for i, f in enumerate(flags):
+                if f == '--export-dir' and i + 1 < len(flags):
+                    export_dir = flags[i + 1]
+                elif f.startswith('--export-dir='):
+                    export_dir = f.split('=', 1)[1]
+            return cmd_build(spec_path, dry_run=dry_run, export=export, export_dir=export_dir)
         elif command in ('scaffold', 'validate'):
             return cmd_single_phase(command, spec_path)
         else:

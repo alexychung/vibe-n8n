@@ -6,7 +6,7 @@ Renders a markdown status table after each phase.
 from dataclasses import dataclass, field
 from typing import Optional
 
-PHASES = ('SCAFFOLD', 'WIRE', 'TEST', 'AUDIT', 'HARDEN', 'CODIFY', 'DEPLOY')
+PHASES = ('SCAFFOLD', 'WIRE', 'TEST', 'AUDIT', 'HARDEN', 'CODIFY', 'DEPLOY', 'EXPORT')
 
 
 @dataclass

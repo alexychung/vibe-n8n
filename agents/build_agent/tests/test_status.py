@@ -15,7 +15,7 @@ class TestBuildStatus(unittest.TestCase):
         """All phases start as pending."""
         status = BuildStatus('Test Workflow')
         table = status.to_dict()
-        for phase in ['SCAFFOLD', 'WIRE', 'TEST', 'AUDIT', 'HARDEN', 'CODIFY', 'DEPLOY']:
+        for phase in ['SCAFFOLD', 'WIRE', 'TEST', 'AUDIT', 'HARDEN', 'CODIFY', 'DEPLOY', 'EXPORT']:
             self.assertEqual(table[phase]['status'], 'pending')
 
     def test_mark_done(self):
@@ -65,7 +65,7 @@ class TestBuildStatus(unittest.TestCase):
         status = BuildStatus('Test Workflow')
         md = status.render()
 
-        for phase in ['SCAFFOLD', 'WIRE', 'TEST', 'AUDIT', 'HARDEN', 'CODIFY', 'DEPLOY']:
+        for phase in ['SCAFFOLD', 'WIRE', 'TEST', 'AUDIT', 'HARDEN', 'CODIFY', 'DEPLOY', 'EXPORT']:
             self.assertIn(phase, md, f'Phase {phase} missing from rendered output')
 
     def test_workflow_id_tracking(self):
