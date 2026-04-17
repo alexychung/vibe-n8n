@@ -1,9 +1,13 @@
 """CLI entry point for the build agent.
 
 Usage:
-    python -m build_agent build spec.json          # Full pipeline
-    python -m build_agent scaffold spec.json       # Single phase
-    python -m build_agent build spec.json --dry-run  # Validate only
+    python -m build_agent build spec.json             # Full pipeline (+ auto-export)
+    python -m build_agent build spec.json --dry-run   # Validate only
+    python -m build_agent build spec.json --no-export # Skip EXPORT phase
+    python -m build_agent scaffold spec.json          # Single phase
+    python -m build_agent validate spec.json          # Parse + validate spec only
+    python -m build_agent list                        # List deployed workflows
+    python -m build_agent export <wf-id> <spec.json>  # Re-export a deployed workflow
 """
 import json
 import os
@@ -20,7 +24,7 @@ from test_runner import run_tests, render_results
 from auditor import audit_workflow, render_findings
 from harden import harden
 from deploy import deploy
-from export import export_workflow
+from export import export_workflow, _slugify
 from status import BuildStatus
 
 
@@ -207,33 +211,103 @@ def cmd_single_phase(phase: str, spec_path: str):
     return 0
 
 
+def cmd_list():
+    """List all deployed workflows with IDs, names, active state, and slugs."""
+    if not os.environ.get('N8N_API_KEY'):
+        print('Error: N8N_API_KEY not set. Add it to .env or set the environment variable.')
+        return 1
+
+    client = N8nClient()
+    workflows = client.list_workflows()
+
+    if not workflows:
+        print('No workflows deployed.')
+        return 0
+
+    # Column widths computed from data, capped for sanity
+    id_w = max(len('ID'), max(len(w.get('id', '')) for w in workflows))
+    name_w = min(50, max(len('Name'), max(len(w.get('name', '')) for w in workflows)))
+    slugs = [_slugify(w.get('name', '')) for w in workflows]
+    slug_w = min(40, max(len('Slug'), max(len(s) for s in slugs)))
+
+    header = f'{"ID":<{id_w}}  {"Active":<6}  {"Name":<{name_w}}  {"Slug":<{slug_w}}'
+    print(header)
+    print('-' * len(header))
+    for w, slug in zip(workflows, slugs):
+        name = (w.get('name', '') or '')[:name_w]
+        slug_out = slug[:slug_w]
+        active = 'yes' if w.get('active') else 'no'
+        print(f'{w.get("id", ""):<{id_w}}  {active:<6}  {name:<{name_w}}  {slug_out:<{slug_w}}')
+
+    print(f'\n{len(workflows)} workflow(s)')
+    return 0
+
+
+def cmd_export(workflow_id: str, spec_path: str, export_dir: str = 'workflows/live'):
+    """Re-export an already-deployed workflow by ID, using a spec for README context."""
+    if not os.environ.get('N8N_API_KEY'):
+        print('Error: N8N_API_KEY not set. Add it to .env or set the environment variable.')
+        return 1
+
+    spec = load_spec(spec_path)
+    client = N8nClient()
+
+    try:
+        result = export_workflow(spec, client, workflow_id, output_dir=export_dir)
+    except N8nApiError as e:
+        print(f'n8n API error: {e}')
+        return 1
+
+    print(f'Exported workflow {workflow_id} ({result["node_count"]} nodes):')
+    print(f'  {result["json_path"]}')
+    print(f'  {result["readme_path"]}')
+    return 0
+
+
+def _extract_flag_value(flags: list, name: str, default: str) -> str:
+    """Extract a CLI flag value supporting both --flag value and --flag=value forms."""
+    for i, f in enumerate(flags):
+        if f == f'--{name}' and i + 1 < len(flags):
+            return flags[i + 1]
+        if f.startswith(f'--{name}='):
+            return f.split('=', 1)[1]
+    return default
+
+
 def main():
     args = sys.argv[1:]
     if not args:
-        print('Usage: python -m build_agent <command> <spec.json> [--dry-run]')
-        print('Commands: build, scaffold, validate')
+        print('Usage: python -m build_agent <command> [args...]')
+        print('Commands: build, scaffold, validate, list, export')
         return 1
 
     command = args[0]
-    if len(args) < 2:
-        print(f'Missing spec path for command: {command}')
-        return 1
-
-    spec_path = args[1]
-    flags = args[2:]
-
     load_env()
 
     try:
+        if command == 'list':
+            return cmd_list()
+
+        if command == 'export':
+            if len(args) < 3:
+                print('Usage: python -m build_agent export <workflow-id> <spec.json> [--export-dir=DIR]')
+                return 1
+            workflow_id = args[1]
+            spec_path = args[2]
+            export_dir = _extract_flag_value(args[3:], 'export-dir', 'workflows/live')
+            return cmd_export(workflow_id, spec_path, export_dir=export_dir)
+
+        # All remaining commands take a spec path
+        if len(args) < 2:
+            print(f'Missing spec path for command: {command}')
+            return 1
+        spec_path = args[1]
+        flags = args[2:]
+
         if command == 'build':
             dry_run = '--dry-run' in flags
             export = '--no-export' not in flags
-            export_dir = 'workflows/live'
-            for i, f in enumerate(flags):
-                if f == '--export-dir' and i + 1 < len(flags):
-                    export_dir = flags[i + 1]
-                elif f.startswith('--export-dir='):
-                    export_dir = f.split('=', 1)[1]
+            export_dir = _extract_flag_value(flags, 'export-dir', 'workflows/live')
             return cmd_build(spec_path, dry_run=dry_run, export=export, export_dir=export_dir)
         elif command in ('scaffold', 'validate'):
             return cmd_single_phase(command, spec_path)

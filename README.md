@@ -102,14 +102,16 @@ python -m agents.build_agent build spec.json                   # full pipeline
 python -m agents.build_agent build spec.json --dry-run         # validate only
 python -m agents.build_agent build spec.json --no-export       # skip EXPORT
 python -m agents.build_agent build spec.json --export-dir=out  # custom dir
-python -m agents.build_agent validate spec.json
-python -m agents.build_agent scaffold spec.json
+python -m agents.build_agent validate spec.json                # parse + validate spec only
+python -m agents.build_agent scaffold spec.json                # run SCAFFOLD only (debug)
+python -m agents.build_agent list                              # list all deployed workflows
+python -m agents.build_agent export <wf-id> spec.json          # re-export without rebuilding
 ```
 
 ## Tests
 
 ```bash
-python -m pytest agents/build_agent/tests/ -v    # 163 tests
+python -m pytest agents/build_agent/tests/ -v    # 237 tests
 python -m pytest agents/pm_agent/tests/ -v       # 58 tests
 ```
 
@@ -142,7 +144,7 @@ See `specs/` for the full design rationale.
 ## Status
 
 - ✅ PM Agent: implemented (58/58 tests passing, first live run 2026-04-15)
-- ✅ Build Agent: implemented (163/163 tests passing), EXPORT phase added 2026-04-17
+- ✅ Build Agent: implemented (237/237 tests passing), EXPORT phase + `list`/`export` CLI commands added 2026-04-17
 - 🚧 Multi-branch wiring (3+ terminal `respondToWebhook` branches) — single biggest gap blocking complex PM specs
 - 🚧 Credential resolution in WIRE — deferred, needed for any workflow using external APIs
 - 🚧 CODIFY phase — deferred until 3+ workflows are deployed
