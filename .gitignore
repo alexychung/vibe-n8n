@@ -1,7 +1,39 @@
+# Secrets & private docs
 .env
+CLAUDE.md
+Notion.txt
+example-order-automation.pdf
+.claude/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 .pytest_cache/
-example-order-automation.pdf
-Notion.txt
-CLAUDE.md
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Runtime logs
+build-logs/*
+!build-logs/.gitkeep
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor backups
+*.swp
+*.swo
+*.bak
+*~
