@@ -23,6 +23,7 @@ cmd_export = _cli.cmd_export
 load_spec = _cli.load_spec
 _extract_flag_value = _cli._extract_flag_value
 _render_topology = _cli._render_topology
+_write_auth_log = _cli._write_auth_log
 
 from models import ValidationError
 
@@ -210,6 +211,49 @@ class TestRenderTopology(unittest.TestCase):
         out = _render_topology(spec)
         self.assertIn('cron', out)
         self.assertIn('0 3 * * *', out)
+
+
+class TestWriteAuthLog(unittest.TestCase):
+
+    def _make_auth(self, node_name='Hook', token='t0k3n'):
+        from harden import GeneratedAuth, WEBHOOK_AUTH_HEADER
+        return GeneratedAuth(
+            node_name=node_name,
+            header_name=WEBHOOK_AUTH_HEADER,
+            token=token,
+            credential_id='cred-1',
+            credential_name='Wf — Hook auth',
+        )
+
+    def test_writes_dotenv_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_auth_log('My Workflow', [self._make_auth()], log_dir=tmp)
+            self.assertTrue(os.path.exists(path))
+            self.assertTrue(path.endswith('my-workflow-auth.env'))
+            content = open(path, encoding='utf-8').read()
+            self.assertIn('WEBHOOK_AUTH_HEADER=X-Webhook-Auth', content)
+            self.assertIn('WEBHOOK_AUTH_TOKEN=t0k3n', content)
+            self.assertIn('# node: Hook', content)
+
+    def test_multiple_auths_get_suffixed_keys(self):
+        import tempfile
+        auths = [
+            self._make_auth(node_name='HookA', token='tokA'),
+            self._make_auth(node_name='HookB', token='tokB'),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_auth_log('Wf', auths, log_dir=tmp)
+            content = open(path, encoding='utf-8').read()
+            self.assertIn('WEBHOOK_AUTH_TOKEN_1=tokA', content)
+            self.assertIn('WEBHOOK_AUTH_TOKEN_2=tokB', content)
+
+    def test_creates_log_dir_if_missing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, 'nested', 'logs')
+            path = _write_auth_log('Wf', [self._make_auth()], log_dir=nested)
+            self.assertTrue(os.path.exists(path))
 
 
 class TestCmdExport(unittest.TestCase):

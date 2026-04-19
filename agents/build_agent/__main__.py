@@ -9,9 +9,19 @@ Usage:
     python -m build_agent list                        # List deployed workflows
     python -m build_agent export <wf-id> <spec.json>  # Re-export a deployed workflow
 """
+import io
 import json
 import os
 import sys
+
+# Fix Windows console encoding — topology uses box-drawing glyphs (●│├) and
+# generated auth messages can include Unicode from workflow names. Default
+# cp1252 codec crashes on these; force UTF-8 to match the PM Agent.
+# Only patch when run as the script entry (not when test code imports us via
+# importlib — that stomps on pytest's capture wrapper).
+if sys.platform == 'win32' and __name__ == '__main__':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # Ensure the package directory is on the path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -128,8 +138,11 @@ def cmd_build(
 
         # HARDEN
         unfixed_warnings: list = []
+        generated_auth: list = []
         if critical > 0 or warning > 0:
-            final_findings = harden(client, workflow_id)
+            harden_result = harden(client, workflow_id, workflow_name=spec.workflow_name)
+            final_findings = harden_result.findings
+            generated_auth = harden_result.generated_auth
             remaining_critical = sum(1 for f in final_findings if f.severity == 'CRITICAL')
             remaining_warning = sum(1 for f in final_findings if f.severity == 'WARNING')
             fixed = warning - remaining_warning
@@ -141,6 +154,8 @@ def cmd_build(
                 return 1
             else:
                 msg = f'Fixed {fixed}/{warning} warnings'
+                if generated_auth:
+                    msg += f' (incl. {len(generated_auth)} webhook auth credential{"s" if len(generated_auth) > 1 else ""})'
                 if remaining_warning > 0:
                     msg += f'; {remaining_warning} need human review'
                 status.done('HARDEN', msg)
@@ -149,6 +164,14 @@ def cmd_build(
             status.done('HARDEN', 'No findings to fix')
         print(status.render())
         print()
+
+        if generated_auth:
+            auth_log_path = _write_auth_log(spec.workflow_name, generated_auth)
+            print('Webhook auth credentials created (save these — tokens are not recoverable):')
+            for a in generated_auth:
+                print(f'  - node "{a.node_name}": header {a.header_name}: {a.token}')
+            print(f'Tokens also written to {auth_log_path}')
+            print()
 
         if unfixed_warnings:
             print('Remaining warnings (not auto-fixable — require human action):')
@@ -161,7 +184,8 @@ def cmd_build(
         print()
 
         # DEPLOY
-        deploy_result = deploy(spec, client, workflow_id)
+        smoke_headers = {generated_auth[0].header_name: generated_auth[0].token} if generated_auth else None
+        deploy_result = deploy(spec, client, workflow_id, webhook_headers=smoke_headers)
         if deploy_result['smoke_test_passed']:
             status.done('DEPLOY', f'Workflow {workflow_id} active, smoke test passed')
         else:
@@ -172,7 +196,13 @@ def cmd_build(
         # EXPORT
         if export:
             try:
-                result = export_workflow(spec, client, workflow_id, output_dir=export_dir)
+                result = export_workflow(
+                    spec,
+                    client,
+                    workflow_id,
+                    output_dir=export_dir,
+                    generated_auth=generated_auth,
+                )
                 status.done(
                     'EXPORT',
                     f"{result['json_path']} + README ({result['node_count']} nodes)",
@@ -261,6 +291,32 @@ def cmd_list(as_json: bool = False):
 
     print(f'\n{len(workflows)} workflow(s)')
     return 0
+
+
+def _write_auth_log(workflow_name: str, generated_auth: list, log_dir: str = 'build-logs') -> str:
+    """Persist generated webhook-auth tokens to a gitignored log file.
+
+    Writes a dotenv-style file that's easy to source or read. Path:
+    `{log_dir}/{slug}-auth.env`. Overwrites an existing file — on re-builds
+    the old tokens would no longer be attached to the workflow's nodes anyway.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    slug = _slugify(workflow_name)
+    path = os.path.join(log_dir, f'{slug}-auth.env')
+    lines = [
+        f'# Webhook auth tokens for: {workflow_name}',
+        '# Generated during HARDEN — save these; n8n masks credential values after creation.',
+        '',
+    ]
+    for i, a in enumerate(generated_auth):
+        suffix = '' if len(generated_auth) == 1 else f'_{i + 1}'
+        lines.append(f'# node: {a.node_name}')
+        lines.append(f'WEBHOOK_AUTH_HEADER{suffix}={a.header_name}')
+        lines.append(f'WEBHOOK_AUTH_TOKEN{suffix}={a.token}')
+        lines.append('')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    return path
 
 
 def _render_topology(spec) -> str:

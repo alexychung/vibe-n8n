@@ -45,7 +45,7 @@ class TestDeploy(unittest.TestCase):
         result = deploy(spec, client, 'wf-1')
 
         self.assertTrue(result['smoke_test_passed'])
-        client.send_webhook.assert_called_once_with('test-hook', {'a': 1})
+        client.send_webhook.assert_called_once_with('test-hook', {'a': 1}, headers=None)
 
     def test_smoke_test_fails(self):
         spec = _make_spec()
@@ -100,6 +100,19 @@ class TestDeploy(unittest.TestCase):
         self.assertFalse(result['smoke_test_passed'])
         self.assertIn('Validation failed', result['smoke_test_error'])
         client.send_webhook.assert_not_called()
+
+    def test_smoke_test_forwards_auth_headers(self):
+        """When HARDEN added auth, deploy's smoke test must send the token header."""
+        spec = _make_spec()
+        client = MagicMock()
+        client.activate_workflow.return_value = {'active': True}
+        client.send_webhook.return_value = {'status': 'ok'}
+
+        headers = {'X-Webhook-Auth': 't0k3n'}
+        result = deploy(spec, client, 'wf-1', webhook_headers=headers)
+
+        self.assertTrue(result['smoke_test_passed'])
+        client.send_webhook.assert_called_once_with('test-hook', {'a': 1}, headers=headers)
 
     def test_result_includes_workflow_id(self):
         spec = _make_spec()

@@ -53,7 +53,7 @@ class N8nClient:
         except urllib.error.URLError as e:
             raise N8nApiError(0, str(e.reason), url) from e
 
-    def _webhook_request(self, path: str, body: Any = None) -> Any:
+    def _webhook_request(self, path: str, body: Any = None, headers: Optional[dict] = None) -> Any:
         """Send data to a webhook endpoint. Returns response body with http_status merged in.
 
         If the response body is a JSON object, returns {**body, 'http_status': code}.
@@ -61,12 +61,16 @@ class N8nClient:
         On non-JSON responses, returns {'body': raw_text, 'http_status': code}.
         HTTP 4xx/5xx responses also return a dict (not raised) so test cases can
         match against status codes and error bodies.
+
+        `headers`: optional dict of extra request headers (e.g. auth).
         """
         url = f'{self.base_url}/webhook/{path}'
         data = json.dumps(body).encode('utf-8') if body is not None else None
-        headers = {'Content-Type': 'application/json'} if data else {}
+        req_headers = {'Content-Type': 'application/json'} if data else {}
+        if headers:
+            req_headers.update(headers)
 
-        req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+        req = urllib.request.Request(url, data=data, headers=req_headers, method='POST')
 
         def _wrap(raw: bytes, status: int) -> Any:
             text = raw.decode('utf-8', errors='replace')
@@ -145,9 +149,12 @@ class N8nClient:
 
     # --- Webhooks ---
 
-    def send_webhook(self, path: str, data: Any = None) -> Any:
-        """Send data to a workflow's webhook endpoint."""
-        return self._webhook_request(path, data)
+    def send_webhook(self, path: str, data: Any = None, headers: Optional[dict] = None) -> Any:
+        """Send data to a workflow's webhook endpoint.
+
+        `headers`: optional dict of extra request headers (e.g. auth).
+        """
+        return self._webhook_request(path, data, headers=headers)
 
     # --- Executions ---
 
@@ -165,3 +172,16 @@ class N8nClient:
         """List all credentials. Returns the data array."""
         result = self._request('GET', '/api/v1/credentials')
         return result.get('data', [])
+
+    def create_credential(self, name: str, type: str, data: dict) -> dict:
+        """Create a new credential. Returns {id, name, type, ...}.
+
+        `type` is the n8n credential type name (e.g. 'httpHeaderAuth').
+        `data` is the credential's secret fields; format depends on `type`.
+        For 'httpHeaderAuth', data = {'name': '<header>', 'value': '<token>'}.
+        """
+        return self._request('POST', '/api/v1/credentials', {
+            'name': name,
+            'type': type,
+            'data': data,
+        })

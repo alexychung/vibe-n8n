@@ -104,6 +104,57 @@ class TestSendWebhookInjectsHttpStatus(unittest.TestCase):
                 self._client().send_webhook('p')
         self.assertEqual(ctx.exception.status_code, 0)
 
+    def test_send_webhook_forwards_custom_headers(self):
+        """send_webhook must attach caller-provided headers (e.g. X-Webhook-Auth)."""
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured['headers'] = dict(req.header_items())
+            return _FakeResponse(json.dumps({'ok': True}).encode(), status=200)
+
+        with patch('urllib.request.urlopen', side_effect=fake_urlopen):
+            self._client().send_webhook('p', {'in': 1}, headers={'X-Webhook-Auth': 't0k3n'})
+
+        # urllib title-cases header names
+        self.assertEqual(captured['headers'].get('X-webhook-auth'), 't0k3n')
+        self.assertEqual(captured['headers'].get('Content-type'), 'application/json')
+
+
+class TestCreateCredential(unittest.TestCase):
+
+    def _client(self):
+        return N8nClient(base_url='http://test', api_key='key')
+
+    def test_posts_to_credentials_endpoint(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured['url'] = req.full_url
+            captured['method'] = req.get_method()
+            captured['body'] = json.loads(req.data.decode('utf-8'))
+            captured['api_key'] = req.get_header('X-n8n-api-key')
+            return _FakeResponse(
+                json.dumps({'id': 'cred-1', 'name': 'n', 'type': 'httpHeaderAuth'}).encode(),
+                status=200,
+            )
+
+        with patch('urllib.request.urlopen', side_effect=fake_urlopen):
+            result = self._client().create_credential(
+                name='n',
+                type='httpHeaderAuth',
+                data={'name': 'X-Webhook-Auth', 'value': 'abc'},
+            )
+
+        self.assertEqual(captured['url'], 'http://test/api/v1/credentials')
+        self.assertEqual(captured['method'], 'POST')
+        self.assertEqual(captured['body'], {
+            'name': 'n',
+            'type': 'httpHeaderAuth',
+            'data': {'name': 'X-Webhook-Auth', 'value': 'abc'},
+        })
+        self.assertEqual(captured['api_key'], 'key')
+        self.assertEqual(result['id'], 'cred-1')
+
 
 if __name__ == '__main__':
     unittest.main()

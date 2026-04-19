@@ -121,6 +121,31 @@ class TestRenderReadme(unittest.TestCase):
         self.assertIn('Select `my-slug.json`', md)
         self.assertIn('--data-binary @my-slug.json', md)
 
+    def test_no_auth_block_without_generated_auth(self):
+        spec = _make_spec()
+        md = _render_readme(spec, {'nodes': []}, 'x.json')
+        self.assertNotIn('Calling the Webhook', md)
+        self.assertNotIn('Auto-generated webhook auth', md)
+
+    def test_auth_block_rendered_when_generated_auth_present(self):
+        """When HARDEN generated auth, the README documents the requirement (not tokens)."""
+        from harden import GeneratedAuth, WEBHOOK_AUTH_HEADER
+        spec = _make_spec()
+        auth = [GeneratedAuth(
+            node_name='Webhook',
+            header_name=WEBHOOK_AUTH_HEADER,
+            token='SUPER-SECRET-TOKEN-MUST-NOT-APPEAR',
+            credential_id='cred-1',
+            credential_name='Webhook Echo — Webhook auth',
+        )]
+        md = _render_readme(spec, {'nodes': []}, 'x.json', generated_auth=auth)
+        self.assertIn('Calling the Webhook', md)
+        self.assertIn(WEBHOOK_AUTH_HEADER, md)
+        self.assertIn('Auto-generated webhook auth', md)
+        # Critical: tokens MUST NOT be embedded in the README (it gets committed).
+        self.assertNotIn('SUPER-SECRET-TOKEN-MUST-NOT-APPEAR', md)
+        self.assertIn('build-logs/', md)
+
 
 class TestExportWorkflow(unittest.TestCase):
     def test_writes_json_and_readme(self):
