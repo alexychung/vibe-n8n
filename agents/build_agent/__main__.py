@@ -71,12 +71,9 @@ def cmd_build(
 
     if dry_run:
         print(f'Spec: {spec.workflow_name}')
-        print(f'Trigger: {spec.trigger.type} ({spec.trigger.path})')
-        print(f'Steps: {len(spec.steps)}')
-        for s in spec.steps:
-            print(f'  - {s.name} ({s.node_type})')
-        print(f'Gates: {len(spec.gates)}')
-        print(f'Test cases: {len(spec.test_cases)}')
+        print(f'Steps: {len(spec.steps)}, Gates: {len(spec.gates)}, Test cases: {len(spec.test_cases)}')
+        print()
+        print(_render_topology(spec))
         print('\nDry run complete — no workflow created.')
         return 0
 
@@ -130,10 +127,12 @@ def cmd_build(
         print()
 
         # HARDEN
+        unfixed_warnings: list = []
         if critical > 0 or warning > 0:
             final_findings = harden(client, workflow_id)
             remaining_critical = sum(1 for f in final_findings if f.severity == 'CRITICAL')
             remaining_warning = sum(1 for f in final_findings if f.severity == 'WARNING')
+            fixed = warning - remaining_warning
             if remaining_critical > 0:
                 status.fail('HARDEN', f'{remaining_critical} critical remain')
                 print(status.render())
@@ -141,11 +140,20 @@ def cmd_build(
                 print(render_findings(final_findings))
                 return 1
             else:
-                status.done('HARDEN', f'Fixed {warning - remaining_warning} warnings')
+                msg = f'Fixed {fixed}/{warning} warnings'
+                if remaining_warning > 0:
+                    msg += f'; {remaining_warning} need human review'
+                status.done('HARDEN', msg)
+                unfixed_warnings = [f for f in final_findings if f.severity == 'WARNING']
         else:
             status.done('HARDEN', 'No findings to fix')
         print(status.render())
         print()
+
+        if unfixed_warnings:
+            print('Remaining warnings (not auto-fixable — require human action):')
+            print(render_findings(unfixed_warnings))
+            print()
 
         # CODIFY
         status.skip('CODIFY', 'deferred')
@@ -211,7 +219,7 @@ def cmd_single_phase(phase: str, spec_path: str):
     return 0
 
 
-def cmd_list():
+def cmd_list(as_json: bool = False):
     """List all deployed workflows with IDs, names, active state, and slugs."""
     if not os.environ.get('N8N_API_KEY'):
         print('Error: N8N_API_KEY not set. Add it to .env or set the environment variable.')
@@ -219,6 +227,18 @@ def cmd_list():
 
     client = N8nClient()
     workflows = client.list_workflows()
+
+    if as_json:
+        print(json.dumps([
+            {
+                'id': w.get('id', ''),
+                'name': w.get('name', ''),
+                'active': bool(w.get('active')),
+                'slug': _slugify(w.get('name', '')),
+            }
+            for w in workflows
+        ], indent=2))
+        return 0
 
     if not workflows:
         print('No workflows deployed.')
@@ -241,6 +261,41 @@ def cmd_list():
 
     print(f'\n{len(workflows)} workflow(s)')
     return 0
+
+
+def _render_topology(spec) -> str:
+    """Render a simple ASCII topology of the workflow spec for --dry-run."""
+    lines = ['Topology:']
+    trigger_info = spec.trigger.type
+    details = []
+    if spec.trigger.path:
+        details.append(f'/{spec.trigger.path}')
+    if spec.trigger.method:
+        details.append(spec.trigger.method)
+    if spec.trigger.schedule:
+        details.append(f'cron={spec.trigger.schedule}')
+    if details:
+        trigger_info += ' (' + ' '.join(details) + ')'
+    lines.append(f'  ● {trigger_info}')
+
+    by_id = {s.id: s for s in spec.steps}
+    gates_by_step = {g.after_step: g for g in spec.gates}
+
+    def _label(step_id: str) -> str:
+        s = by_id.get(step_id)
+        return f'{s.name} ({s.node_type})' if s else f'?{step_id}'
+
+    for s in spec.steps:
+        lines.append(f'    │')
+        lines.append(f'  ├─ [{s.id}] {s.name} ({s.node_type})')
+        g = gates_by_step.get(s.id)
+        if g:
+            if g.pass_to:
+                lines.append(f'  │    ├─ pass → {_label(g.pass_to)}')
+            if g.fail_to:
+                lines.append(f'  │    └─ fail → {_label(g.fail_to)}')
+
+    return '\n'.join(lines)
 
 
 def cmd_export(workflow_id: str, spec_path: str, export_dir: str = 'workflows/live'):
@@ -286,7 +341,7 @@ def main():
 
     try:
         if command == 'list':
-            return cmd_list()
+            return cmd_list(as_json='--json' in args[1:])
 
         if command == 'export':
             if len(args) < 3:
