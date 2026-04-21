@@ -186,12 +186,30 @@ def _translate_if_params(spec_params: dict) -> dict:
     }
 
 
+def _translate_respond_to_webhook_params(spec_params: dict) -> dict:
+    """Move top-level responseCode into options.responseCode.
+
+    n8n v1 respondToWebhook reads the status code from options.responseCode.
+    PM-generated specs put it top-level; pass-through lets n8n silently fall
+    back to 200 regardless of the emitted value.
+    """
+    p = dict(spec_params)
+    code = p.pop('responseCode', None)
+    if code is not None:
+        opts = dict(p.get('options') or {})
+        opts.setdefault('responseCode', code)
+        p['options'] = opts
+    return p
+
+
 def _configure_node(node: dict, step: Step) -> dict:
     """Apply spec parameters to a node."""
     if step.node_type == 'n8n-nodes-base.set':
         node['parameters'] = _translate_set_params(step.parameters)
     elif step.node_type == 'n8n-nodes-base.if':
         node['parameters'] = _translate_if_params(step.parameters)
+    elif step.node_type == 'n8n-nodes-base.respondToWebhook':
+        node['parameters'] = _translate_respond_to_webhook_params(step.parameters)
     else:
         # For other node types, pass parameters through
         node['parameters'] = step.parameters
@@ -222,7 +240,8 @@ def _build_connections(spec: WorkflowSpec, nodes: list[dict]) -> dict:
         'main': [[{'node': step_name[first_step.id], 'type': 'main', 'index': 0}]]
     }
 
-    # Figure out which steps are gate branch targets (they get connected by the gate, not sequentially)
+    # Validate gate targets and collect the set of steps that are reached via
+    # a gate (so linear fallback doesn't chain into them out of order).
     gate_targets = set()
     for gate in spec.gates:
         for target_id in (gate.pass_to, gate.fail_to):
@@ -233,59 +252,40 @@ def _build_connections(spec: WorkflowSpec, nodes: list[dict]) -> dict:
                     )
                 gate_targets.add(target_id)
 
-    # Build the step order index for quick lookups
-    step_index = {s.id: i for i, s in enumerate(spec.steps)}
-
-    # For each gate, figure out the "continuation" step — the next main-path
-    # step after the gate.  Branch targets that aren't terminal wire into this.
-    gate_continuation = {}  # gate.after_step → next main-path step id (or None)
-    for gate in spec.gates:
-        after_idx = step_index.get(gate.after_step, -1)
-        continuation = None
-        for s in spec.steps[after_idx + 1:]:
-            if s.id not in gate_targets:
-                continuation = s.id
-                break
-        gate_continuation[gate.after_step] = continuation
-
-    # Connect steps, handling gates and sequential connections
-    main_steps = [s for s in spec.steps if s.id not in gate_targets]
-    for i, step in enumerate(main_steps):
+    # For each step, emit its outbound connection.
+    #   - If the step is a gate's after_step, the gate decides the outputs.
+    #     * conditional_branch → two outputs [pass_to, fail_to] (empty list for a missing side)
+    #     * sequential (or empty-type with pass_to) → single output to pass_to
+    #   - Otherwise fall back to "next step in spec.steps order that is not
+    #     already a gate target". Skip the fallback entirely for respondToWebhook
+    #     terminals so they don't chain into a later branch.
+    for i, step in enumerate(spec.steps):
         gate = _find_gate_for_step(spec, step.id)
-        if gate:
-            # This step is a gate — connect true/false branches
+        # A gate is branching if it has a fail_to or is explicitly conditional.
+        # Pure sequential gates (only pass_to, non-conditional type) emit a single output.
+        is_branch = bool(gate) and (gate.type == 'conditional_branch' or bool(gate.fail_to))
+        if is_branch:
             true_name = step_name.get(gate.pass_to, '')
             false_name = step_name.get(gate.fail_to, '')
-            outputs = []
-            outputs.append([{'node': true_name, 'type': 'main', 'index': 0}] if true_name else [])
-            outputs.append([{'node': false_name, 'type': 'main', 'index': 0}] if false_name else [])
+            outputs = [
+                [{'node': true_name, 'type': 'main', 'index': 0}] if true_name else [],
+                [{'node': false_name, 'type': 'main', 'index': 0}] if false_name else [],
+            ]
             connections[step_name[step.id]] = {'main': outputs}
-        elif i + 1 < len(main_steps):
-            # Sequential step — connect to next main step
-            next_step = main_steps[i + 1]
+        elif gate and gate.pass_to:
             connections[step_name[step.id]] = {
-                'main': [[{'node': step_name[next_step.id], 'type': 'main', 'index': 0}]]
+                'main': [[{'node': step_name[gate.pass_to], 'type': 'main', 'index': 0}]]
             }
-
-    # Wire gate branch targets to continuation steps (if they're not terminal
-    # and don't themselves have gates).
-    for gate in spec.gates:
-        cont_id = gate_continuation.get(gate.after_step)
-        if not cont_id:
-            continue  # no continuation — branch targets are terminal
-        cont_name = step_name[cont_id]
-        for target_id in (gate.pass_to, gate.fail_to):
-            if not target_id:
-                continue
-            target_step_name = step_name.get(target_id, '')
-            if not target_step_name:
-                continue
-            # Don't overwrite if the target already has connections (e.g., it's a gate itself)
-            if target_step_name in connections:
-                continue
-            connections[target_step_name] = {
-                'main': [[{'node': cont_name, 'type': 'main', 'index': 0}]]
-            }
+        else:
+            node = _find_node_by_id(nodes, step.id)
+            if 'respondToWebhook' in (node.get('type') or ''):
+                continue  # terminal — never chain
+            for next_step in spec.steps[i + 1:]:
+                if next_step.id not in gate_targets:
+                    connections[step_name[step.id]] = {
+                        'main': [[{'node': step_name[next_step.id], 'type': 'main', 'index': 0}]]
+                    }
+                    break
 
     return connections
 

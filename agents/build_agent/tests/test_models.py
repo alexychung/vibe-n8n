@@ -268,10 +268,12 @@ class TestValidation(unittest.TestCase):
         self.assertEqual(len(spec.gates), 1)
 
     def test_unsupported_gate_types_are_dropped(self):
-        """PM-generated 'sequential' and 'error_branch' gates are silently dropped.
+        """conditional_branch and sequential survive; unknown types and
+        gates missing `after_step` are silently dropped.
 
-        Only conditional_branch gates drive wiring — leaving the others in
-        would cause _build_connections to emit broken edges.
+        Sequential gates carry explicit step→step wiring info that wire.py
+        uses to build per-branch chains (e.g., the error-branch responder
+        after an IF). Keeping them is required for multi-terminal webhooks.
         """
         spec = parse_spec({
             'workflow_name': 'X',
@@ -287,12 +289,12 @@ class TestValidation(unittest.TestCase):
                 {'after_step': 's2', 'pass_to': 's3', 'fail_to': 's4', 'type': 'conditional_branch'},
                 {'after_step': 's3', 'pass_to': 's4', 'type': 'sequential'},
                 {'from_step_error': 's1', 'pass_to': 's5', 'type': 'error_branch'},
+                {'after_step': 's1', 'pass_to': 's2', 'type': 'mystery_type'},
             ],
             'test_cases': _VALID_TC,
         })
-        self.assertEqual(len(spec.gates), 1)
-        self.assertEqual(spec.gates[0].after_step, 's2')
-        self.assertEqual(spec.gates[0].type, 'conditional_branch')
+        kept = [(g.after_step, g.type) for g in spec.gates]
+        self.assertEqual(kept, [('s2', 'conditional_branch'), ('s3', 'sequential')])
 
     def test_empty_type_gate_still_accepted(self):
         """Back-compat: legacy specs with no 'type' field still work."""

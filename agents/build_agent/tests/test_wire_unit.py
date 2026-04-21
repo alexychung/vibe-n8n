@@ -14,6 +14,7 @@ from models import WorkflowSpec, Trigger, Step, Gate, TestCase
 from wire import (
     _translate_set_params,
     _translate_if_params,
+    _translate_respond_to_webhook_params,
     _configure_node,
     _build_connections,
     _find_node_by_id,
@@ -556,6 +557,131 @@ class TestGateValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _build_connections(spec, nodes)
         self.assertIn('unknown step', str(ctx.exception))
+
+
+class TestTranslateRespondToWebhookParams(unittest.TestCase):
+    """respondToWebhook requires responseCode under options.responseCode; PM
+    specs put it top-level and n8n silently falls back to 200 on pass-through."""
+
+    def test_moves_response_code_into_options(self):
+        out = _translate_respond_to_webhook_params(
+            {'respondWith': 'json', 'responseCode': 400, 'responseBody': '={{ $json }}'}
+        )
+        self.assertEqual(out['respondWith'], 'json')
+        self.assertEqual(out['responseBody'], '={{ $json }}')
+        self.assertNotIn('responseCode', out)
+        self.assertEqual(out['options'], {'responseCode': 400})
+
+    def test_preserves_existing_options(self):
+        out = _translate_respond_to_webhook_params({
+            'respondWith': 'json',
+            'responseCode': 404,
+            'options': {'responseHeaders': {'X-Test': '1'}},
+        })
+        self.assertEqual(out['options']['responseCode'], 404)
+        self.assertEqual(out['options']['responseHeaders'], {'X-Test': '1'})
+
+    def test_preserves_dynamic_expression(self):
+        out = _translate_respond_to_webhook_params(
+            {'responseCode': '={{ $json.code }}'}
+        )
+        self.assertEqual(out['options'], {'responseCode': '={{ $json.code }}'})
+
+    def test_passthrough_when_no_response_code(self):
+        params = {'respondWith': 'json', 'responseBody': '={{ $json }}'}
+        out = _translate_respond_to_webhook_params(params)
+        self.assertEqual(out, params)
+        self.assertIsNot(out, params)  # defensive copy
+
+    def test_configure_node_routes_to_translator(self):
+        node = {'id': 's1', 'name': 'Respond', 'type': 'n8n-nodes-base.respondToWebhook'}
+        step = Step(
+            id='s1', name='Respond',
+            node_type='n8n-nodes-base.respondToWebhook',
+            parameters={'respondWith': 'json', 'responseCode': 400},
+        )
+        out = _configure_node(node, step)
+        self.assertEqual(out['parameters']['options']['responseCode'], 400)
+        self.assertNotIn('responseCode', out['parameters'])
+
+
+class TestPerBranchSequentialWiring(unittest.TestCase):
+    """When a conditional_branch has its own terminal responder per branch
+    (connected via sequential gates), each branch must chain to its own
+    responder — not share a continuation."""
+
+    def test_conditional_branch_with_per_branch_sequential_followups(self):
+        # Mirrors the greeting-webhook gate graph:
+        #   s1 → s2 (sequential)
+        #   s2 (IF) → s3 pass / s5 fail (conditional_branch)
+        #   s3 → s4 (sequential; s4 is respondToWebhook terminal)
+        #   s5 → s6 (sequential; s6 is respondToWebhook terminal)
+        spec = _make_spec(
+            steps=[
+                Step(id='s1', name='Extract', node_type='n8n-nodes-base.code'),
+                Step(id='s2', name='Check', node_type='n8n-nodes-base.if'),
+                Step(id='s3', name='Generate', node_type='n8n-nodes-base.code'),
+                Step(id='s4', name='Ok', node_type='n8n-nodes-base.respondToWebhook'),
+                Step(id='s5', name='BuildError', node_type='n8n-nodes-base.set'),
+                Step(id='s6', name='Err', node_type='n8n-nodes-base.respondToWebhook'),
+            ],
+            gates=[
+                Gate(after_step='s1', pass_to='s2', type='sequential'),
+                Gate(after_step='s2', pass_to='s3', fail_to='s5', type='conditional_branch'),
+                Gate(after_step='s3', pass_to='s4', type='sequential'),
+                Gate(after_step='s5', pass_to='s6', type='sequential'),
+            ],
+        )
+        nodes = [
+            {'id': 'trigger', 'name': 'Webhook', 'type': 'n8n-nodes-base.webhook'},
+            {'id': 's1', 'name': 'Extract', 'type': 'n8n-nodes-base.code'},
+            {'id': 's2', 'name': 'Check', 'type': 'n8n-nodes-base.if'},
+            {'id': 's3', 'name': 'Generate', 'type': 'n8n-nodes-base.code'},
+            {'id': 's4', 'name': 'Ok', 'type': 'n8n-nodes-base.respondToWebhook'},
+            {'id': 's5', 'name': 'BuildError', 'type': 'n8n-nodes-base.set'},
+            {'id': 's6', 'name': 'Err', 'type': 'n8n-nodes-base.respondToWebhook'},
+        ]
+
+        conns = _build_connections(spec, nodes)
+
+        # Trigger → s1
+        self.assertEqual(conns['Webhook']['main'][0][0]['node'], 'Extract')
+        # s1 → s2 (from sequential gate)
+        self.assertEqual(conns['Extract']['main'][0][0]['node'], 'Check')
+        # s2 (IF) → [s3, s5]
+        self.assertEqual(conns['Check']['main'][0][0]['node'], 'Generate')
+        self.assertEqual(conns['Check']['main'][1][0]['node'], 'BuildError')
+        # Success branch: s3 → s4 (not s5)
+        self.assertEqual(conns['Generate']['main'][0][0]['node'], 'Ok')
+        # Error branch: s5 → s6 (NOT s4) — this is the bug that was fixed
+        self.assertEqual(conns['BuildError']['main'][0][0]['node'], 'Err')
+        # Terminals: no outbound connections
+        self.assertNotIn('Ok', conns)
+        self.assertNotIn('Err', conns)
+
+    def test_sequential_gate_only_spec(self):
+        # Pure linear chain expressed via sequential gates, no branching.
+        spec = _make_spec(
+            steps=[
+                Step(id='s1', name='A', node_type='n8n-nodes-base.code'),
+                Step(id='s2', name='B', node_type='n8n-nodes-base.code'),
+                Step(id='s3', name='C', node_type='n8n-nodes-base.respondToWebhook'),
+            ],
+            gates=[
+                Gate(after_step='s1', pass_to='s2', type='sequential'),
+                Gate(after_step='s2', pass_to='s3', type='sequential'),
+            ],
+        )
+        nodes = [
+            {'id': 'trigger', 'name': 'Webhook', 'type': 'n8n-nodes-base.webhook'},
+            {'id': 's1', 'name': 'A', 'type': 'n8n-nodes-base.code'},
+            {'id': 's2', 'name': 'B', 'type': 'n8n-nodes-base.code'},
+            {'id': 's3', 'name': 'C', 'type': 'n8n-nodes-base.respondToWebhook'},
+        ]
+        conns = _build_connections(spec, nodes)
+        self.assertEqual(conns['A']['main'][0][0]['node'], 'B')
+        self.assertEqual(conns['B']['main'][0][0]['node'], 'C')
+        self.assertNotIn('C', conns)
 
 
 class TestFindHelpers(unittest.TestCase):

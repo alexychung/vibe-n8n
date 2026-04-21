@@ -134,13 +134,14 @@ def parse_spec(raw: dict) -> WorkflowSpec:
         gate_type = g.get('type', '')
         after_step = g.get('after_step', '')
         # PM-generated specs sometimes include invented gate kinds
-        # ("sequential", "error_branch", ...) or gates missing after_step
-        # (error handlers keyed on from_step_error). Only conditional_branch
-        # gates drive wiring; silently drop the rest so the wire phase isn't
-        # fed bogus connection requests.
+        # ("error_branch", ...) or gates missing after_step (error handlers
+        # keyed on from_step_error). Keep conditional_branch (branching) and
+        # sequential (explicit step-to-step) gates — wire.py relies on both
+        # to build per-branch chains. Drop unknown types so wire isn't fed
+        # bogus connection requests.
         if not after_step:
             continue
-        if gate_type and gate_type != 'conditional_branch':
+        if gate_type and gate_type not in ('conditional_branch', 'sequential'):
             continue
         gates.append(Gate(
             after_step=after_step,
