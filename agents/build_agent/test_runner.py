@@ -18,6 +18,30 @@ class RunResult:
     error: str = ''
 
 
+def _normalize_expected(expected: dict) -> dict:
+    """Flatten common PM Agent test-case shape drifts.
+
+    Build Agent response shape (see client._webhook_request): flat dict with
+    `http_status` (snake_case). PM-generated specs sometimes emit:
+      - `httpStatus` (camelCase) instead of `http_status`
+      - `body: {...}` nested wrapper around the actual response fields
+
+    Normalize so _match_expected compares against the real shape without each
+    caller re-hand-fixing the spec.
+    """
+    if not isinstance(expected, dict):
+        return expected
+    exp = dict(expected)
+    camel = exp.pop('httpStatus', None)
+    if camel is not None and 'http_status' not in exp:
+        exp['http_status'] = camel
+    if isinstance(exp.get('body'), dict):
+        body = exp.pop('body')
+        for k, v in body.items():
+            exp.setdefault(k, v)
+    return exp
+
+
 def _match_expected(actual, expected: dict) -> tuple[bool, str]:
     """Check if actual output matches expected.
 
@@ -28,6 +52,7 @@ def _match_expected(actual, expected: dict) -> tuple[bool, str]:
     """
     if not isinstance(actual, dict):
         return False, f'Expected dict response, got {type(actual).__name__}'
+    expected = _normalize_expected(expected)
     for key, exp_val in expected.items():
         if key not in actual:
             return False, f'Missing key: {key}'
@@ -69,10 +94,12 @@ def run_tests(
     # Activate
     client.activate_workflow(workflow_id)
 
+    method = (spec.trigger.method or 'POST').upper()
+
     results = []
     try:
         for tc in spec.test_cases:
-            result = _run_single_test(client, webhook_path, tc)
+            result = _run_single_test(client, webhook_path, tc, method)
             results.append(result)
     finally:
         # Always deactivate after testing
@@ -84,10 +111,23 @@ def run_tests(
     return results
 
 
-def _run_single_test(client: N8nClient, webhook_path: str, tc: TestCase) -> RunResult:
+def _run_single_test(
+    client: N8nClient,
+    webhook_path: str,
+    tc: TestCase,
+    method: str = 'POST',
+) -> RunResult:
     """Run a single test case and return the result."""
     try:
-        actual = client.send_webhook(webhook_path, tc.input)
+        if method == 'GET':
+            # For GET triggers, the PM Agent commonly writes inputs either
+            # wrapped as {query: {...}} or as a flat object. Accept both.
+            query = tc.input.get('query') if isinstance(tc.input, dict) else None
+            if not isinstance(query, dict):
+                query = tc.input if isinstance(tc.input, dict) else {}
+            actual = client.send_webhook(webhook_path, method='GET', query=query)
+        else:
+            actual = client.send_webhook(webhook_path, tc.input)
 
         passed, reason = _match_expected(actual, tc.expected)
 

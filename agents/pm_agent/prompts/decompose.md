@@ -40,8 +40,8 @@ Produce a complete workflow spec as a JSON object. The spec must be consumable b
 - `cost_estimate`: per-run cost estimate
 - `test_cases`: array of AT LEAST 3 test cases, each with:
   - `name`: descriptive (e.g., "Happy path", "Empty input", "API failure")
-  - `input`: the webhook/trigger input data
-  - `expected`: what the output should contain (use "any non-empty string" for dynamic fields like timestamps)
+  - `input`: the webhook/trigger input data (see "Webhook payload contract" below for shape)
+  - `expected`: what the output should contain. **FLAT dict** — do NOT nest response fields under `body`. Use `http_status` (snake_case) for HTTP status assertions, not `httpStatus`. Use "any non-empty string" for dynamic fields like timestamps. Example: `{"http_status": 200, "status": "success", "greeting": "Good Morning, Alice"}`.
 - `components_used`: []
 - `components_needed`: []
 
@@ -67,5 +67,28 @@ Produce a complete workflow spec as a JSON object. The spec must be consumable b
 8. `determinism` should be "1.0" for pure transforms (Set, IF, Code) and external API calls. Reserve "3.0" for LLM/AI nodes only.
 9. **Prefer Code nodes over IF nodes for complex conditions.** If the branching logic involves multiple fields, type checks, null guards, or any logic beyond simple field comparisons — put the logic in a Code node that outputs a boolean flag, then use a trivial IF node to check that flag.
 10. **Do NOT use Merge nodes.** The Build Agent wires steps sequentially and does not support parallel fan-out/merge. If you need to combine data from multiple API calls, make them sequentially in a single Code node or use multiple sequential httpRequest nodes with a Code node to aggregate the results.
+
+## Webhook payload contract (CRITICAL)
+
+Pick ONE of these patterns per webhook trigger and keep `trigger.method`, `input` shape, and Code-node accessors in sync:
+
+**POST with JSON body** (use this for complex/structured input):
+- `trigger.method`: `"POST"`
+- Test case `input`: flat JSON object — `{"name": "Alice", "hour": 9}` (NOT wrapped under `query`)
+- Code nodes accessing the body: **`$json.body.name`**, **`$json.body.hour`**. n8n's v2 webhook node emits `$json = {headers: {...}, body: {...}, query: {...}, params: {...}, ...}` — the POSTed JSON lives under `body`, NOT at the top level. Accessing `$json.name` directly returns undefined and every input fails validation. This is the #1 cause of broken webhook workflows — if your Code node opens with `const body = $json`, you're wrong; use `const body = $json.body`.
+
+```javascript
+// Correct pattern for POST webhook Code node:
+const body = $json.body || {};
+const name = body.name;
+const hour = body.hour;
+```
+
+**GET with query params** (use this for simple key/value lookups):
+- `trigger.method`: `"GET"`
+- Test case `input`: `{"query": {"name": "Alice", "hour": "9"}}` — wrap in a `query` key
+- Code nodes accessing params: `$json.query.name`, `$json.query.hour`. Query values are always strings — coerce in the Code node (`parseInt(...)`).
+
+**NEVER mix patterns** (e.g., POST trigger with `input.query.*` in test cases, or GET trigger with Code nodes reading `$json.body.*`). The Build Agent's test runner strips the `query` wrapper for GET and sends the flat input as the body for POST — mixing breaks both paths.
 
 Respond with ONLY the JSON spec, no explanation.

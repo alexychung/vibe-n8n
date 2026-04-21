@@ -119,6 +119,46 @@ class TestSendWebhookInjectsHttpStatus(unittest.TestCase):
         self.assertEqual(captured['headers'].get('X-webhook-auth'), 't0k3n')
         self.assertEqual(captured['headers'].get('Content-type'), 'application/json')
 
+    def test_get_sends_query_string_no_body(self):
+        """GET webhooks must put inputs in the URL query string and send no body —
+        n8n's webhook node routes GET requests only when the URL matches,
+        and expects query params via $json.query.*."""
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured['url'] = req.full_url
+            captured['method'] = req.get_method()
+            captured['data'] = req.data
+            captured['headers'] = dict(req.header_items())
+            return _FakeResponse(json.dumps({'ok': True}).encode(), status=200)
+
+        with patch('urllib.request.urlopen', side_effect=fake_urlopen):
+            self._client().send_webhook('p', method='GET', query={'name': 'Alice', 'hour': 9})
+
+        self.assertEqual(captured['method'], 'GET')
+        self.assertIsNone(captured['data'])
+        # Both param orderings are acceptable; check membership
+        self.assertIn('name=Alice', captured['url'])
+        self.assertIn('hour=9', captured['url'])
+        # No Content-Type for a bodyless GET
+        self.assertNotIn('Content-type', captured['headers'])
+
+    def test_get_coerces_non_string_query_values(self):
+        """PM Agent test cases write hour: 9 (int); n8n treats query values as strings.
+        The client stringifies so downstream parseInt / regex checks see what a
+        real browser would send."""
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured['url'] = req.full_url
+            return _FakeResponse(b'{}', status=200)
+
+        with patch('urllib.request.urlopen', side_effect=fake_urlopen):
+            self._client().send_webhook('p', method='GET', query={'hour': 9, 'active': True})
+
+        self.assertIn('hour=9', captured['url'])
+        self.assertIn('active=True', captured['url'])
+
 
 class TestCreateCredential(unittest.TestCase):
 

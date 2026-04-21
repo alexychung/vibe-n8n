@@ -37,12 +37,24 @@ def deploy(
         smoke_error = activate_error or 'Workflow failed to activate'
     elif spec.test_cases and spec.trigger.path:
         first_tc = spec.test_cases[0]
+        method = (spec.trigger.method or 'POST').upper()
         try:
-            smoke_result = client.send_webhook(
-                spec.trigger.path,
-                first_tc.input,
-                headers=webhook_headers,
-            )
+            if method == 'GET':
+                query = first_tc.input.get('query') if isinstance(first_tc.input, dict) else None
+                if not isinstance(query, dict):
+                    query = first_tc.input if isinstance(first_tc.input, dict) else {}
+                smoke_result = client.send_webhook(
+                    spec.trigger.path,
+                    headers=webhook_headers,
+                    method='GET',
+                    query=query,
+                )
+            else:
+                smoke_result = client.send_webhook(
+                    spec.trigger.path,
+                    first_tc.input,
+                    headers=webhook_headers,
+                )
             smoke_passed, smoke_error = _match_expected(smoke_result, first_tc.expected)
         except N8nApiError as e:
             smoke_error = str(e)

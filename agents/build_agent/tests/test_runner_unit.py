@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, call
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models import Trigger, Step, TestCase, WorkflowSpec
-from test_runner import _match_expected, run_tests, render_results, RunResult
+from test_runner import _match_expected, _normalize_expected, run_tests, render_results, RunResult
 from client import N8nApiError
 
 
@@ -63,6 +63,57 @@ class TestMatchExpected(unittest.TestCase):
     def test_empty_expected_always_passes(self):
         passed, _ = _match_expected({'anything': 'here'}, {})
         self.assertTrue(passed)
+
+
+class TestNormalizeExpected(unittest.TestCase):
+    """PM Agent emits expected in shapes the Build Agent's response dict doesn't match.
+    _normalize_expected papers over the shape drift before _match_expected runs."""
+
+    def test_renames_camel_http_status(self):
+        out = _normalize_expected({'httpStatus': 200, 'status': 'ok'})
+        self.assertEqual(out, {'http_status': 200, 'status': 'ok'})
+
+    def test_prefers_existing_snake_case(self):
+        out = _normalize_expected({'httpStatus': 200, 'http_status': 400})
+        # snake_case already present — don't let the rename clobber it
+        self.assertEqual(out['http_status'], 400)
+        self.assertNotIn('httpStatus', out)
+
+    def test_flattens_nested_body(self):
+        out = _normalize_expected({
+            'http_status': 200,
+            'body': {'status': 'ok', 'greeting': 'hi'},
+        })
+        self.assertEqual(out, {'http_status': 200, 'status': 'ok', 'greeting': 'hi'})
+
+    def test_flatten_preserves_top_level_collisions(self):
+        out = _normalize_expected({
+            'http_status': 200,
+            'status': 'from_top',
+            'body': {'status': 'from_body'},
+        })
+        # Flat already had 'status'; body.status must not overwrite
+        self.assertEqual(out['status'], 'from_top')
+
+    def test_non_dict_body_ignored(self):
+        # An array or string body is a legitimate flat value — don't flatten
+        out = _normalize_expected({'http_status': 200, 'body': [1, 2]})
+        self.assertEqual(out, {'http_status': 200, 'body': [1, 2]})
+
+    def test_camel_and_nested_body_combined(self):
+        out = _normalize_expected({
+            'httpStatus': 400,
+            'body': {'status': 'error', 'message': 'bad'},
+        })
+        self.assertEqual(out, {'http_status': 400, 'status': 'error', 'message': 'bad'})
+
+    def test_match_expected_applies_normalizer(self):
+        # End-to-end: _match_expected on a PM-shaped expected matches a
+        # Build-Agent-shaped actual without any caller rewrite.
+        actual = {'status': 'ok', 'greeting': 'hi', 'http_status': 200}
+        expected = {'httpStatus': 200, 'body': {'status': 'ok', 'greeting': 'hi'}}
+        passed, err = _match_expected(actual, expected)
+        self.assertTrue(passed, err)
 
 
 class TestRunTests(unittest.TestCase):
@@ -140,6 +191,43 @@ class TestRunTests(unittest.TestCase):
         run_tests(spec, client, 'wf-1')
 
         client.send_webhook.assert_called_once_with('test-hook', {'key': 'val'})
+
+    def test_get_trigger_sends_query_not_body(self):
+        """GET trigger: inputs must go on the URL as query params; send_webhook
+        is called with method='GET' and query=, not as a POST body."""
+        spec = _make_spec(
+            trigger=Trigger(type='webhook', path='test-hook', method='GET'),
+            test_cases=[
+                TestCase(name='tc1', input={'name': 'Alice', 'hour': 9}, expected={'status': 'ok'}),
+            ],
+        )
+        client = MagicMock()
+        client.send_webhook.return_value = {'status': 'ok'}
+
+        run_tests(spec, client, 'wf-1')
+
+        client.send_webhook.assert_called_once_with(
+            'test-hook', method='GET', query={'name': 'Alice', 'hour': 9}
+        )
+
+    def test_get_trigger_strips_query_wrapper(self):
+        """PM Agent often wraps GET inputs as {query: {...}}. Unwrap before sending
+        so $json.query.name resolves on n8n's side (and the raw dict doesn't
+        become a single ?query= param)."""
+        spec = _make_spec(
+            trigger=Trigger(type='webhook', path='test-hook', method='GET'),
+            test_cases=[
+                TestCase(name='tc1', input={'query': {'name': 'Bob', 'hour': 14}}, expected={'status': 'ok'}),
+            ],
+        )
+        client = MagicMock()
+        client.send_webhook.return_value = {'status': 'ok'}
+
+        run_tests(spec, client, 'wf-1')
+
+        client.send_webhook.assert_called_once_with(
+            'test-hook', method='GET', query={'name': 'Bob', 'hour': 14}
+        )
 
 
 class TestRunTestsValidation(unittest.TestCase):

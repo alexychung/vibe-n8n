@@ -29,6 +29,29 @@ If the branch logic is complex (multiple checks, null guards, type coercion), us
 
 **Webhook triggers with `respondToWebhook` nodes: responseMode is auto-set.** Do not specify `responseMode: 'lastNode'` when the workflow contains any `n8n-nodes-base.respondToWebhook` step. The Build Agent sets `responseMode: 'responseNode'` automatically so the trigger waits for the respondToWebhook node instead of using whichever node ran last.
 
+## Test case contract
+
+- `expected` is a **flat dict**. Never nest response fields under `body`. To assert the HTTP status, use `http_status` (snake_case) — not `httpStatus`. Example: `{"http_status": 400, "status": "error", "message": "..."}`.
+- `input` must match `trigger.method`:
+  - POST trigger: flat JSON object like `{"name": "Alice", "hour": 9}`. Code nodes read it as `$json.body.name`.
+  - GET trigger: wrapped as `{"query": {"name": "Alice", "hour": "9"}}`. Code nodes read it as `$json.query.name`. All query values are strings.
+
+## Webhook body access (CRITICAL — common LLM mistake)
+
+For POST webhook triggers, n8n's Webhook Trigger emits `$json = {headers, body, query, params, ...}`. **The POSTed JSON is under `$json.body`, NOT `$json`.** Any Code node that starts with `const body = $json` reads the envelope (headers etc.), not the body, and every field access returns undefined.
+
+```javascript
+// Correct:
+const body = $json.body || {};
+const name = body.name;
+
+// Wrong — every input fails validation:
+const body = $json;
+const name = body.name;  // undefined
+```
+
+If you see `const body = $json;` in a Code node downstream of a POST webhook trigger, fix it.
+
 ## Instructions
 
 1. Apply fixes for all CRITICAL and WARNING findings

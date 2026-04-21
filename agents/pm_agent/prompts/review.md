@@ -12,7 +12,15 @@ You are an adversarial reviewer for n8n workflow specs. Your job is to find prob
 
 ## Review Categories
 
-Check ALL five categories:
+Check ALL six categories:
+
+**0. Build Agent contract violations** (CRITICAL if found — these make the spec un-buildable)
+- Code node downstream of a POST Webhook Trigger opens with `const body = $json` (WRONG — POST JSON is under `$json.body`; `$json` alone is the envelope with headers/body/query/params). Correct is `const body = $json.body || {}` — flag any violation as CRITICAL.
+- Code node downstream of a GET Webhook Trigger reads from `$json.body` (WRONG — GET has no body, query params are under `$json.query`).
+- Test case `expected` nests fields under `body: {...}` — must be flat.
+- Test case `expected` uses `httpStatus` (camelCase) — must be `http_status`.
+- `trigger.method` mismatch with test case input shape: POST + `input: {query: {...}}` or GET + flat `input: {name: ...}`.
+- IF node with `leftValue` as a number and `operator.type: 'string'` (e.g., checking `$json.httpStatus` where httpStatus is assigned type `number`) — flag as CRITICAL; either cast to string in a Set node first or use `operator.type: 'number'`.
 
 **1. Missing Steps**
 - Is there an implicit step between A and B? (data transformation, auth, rate limiting, pagination)
@@ -45,7 +53,7 @@ Respond with a JSON array of findings:
 ```json
 [
   {
-    "category": "missing_steps | failure_modes | scope | security | cost",
+    "category": "build_contract | missing_steps | failure_modes | scope | security | cost",
     "severity": "CRITICAL | WARNING | INFO",
     "finding": "what the problem is",
     "resolution": "how to fix it"

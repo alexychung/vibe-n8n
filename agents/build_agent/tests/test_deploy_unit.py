@@ -114,6 +114,33 @@ class TestDeploy(unittest.TestCase):
         self.assertTrue(result['smoke_test_passed'])
         client.send_webhook.assert_called_once_with('test-hook', {'a': 1}, headers=headers)
 
+    def test_get_trigger_smoke_uses_query(self):
+        """GET trigger smoke test sends query params, not a POST body.
+
+        Mirrors run_tests behavior so active-webhook verification works for
+        the PM Agent's common GET-with-query-params shape."""
+        spec = _make_spec(
+            trigger=Trigger(type='webhook', path='test-hook', method='GET'),
+            test_cases=[TestCase(
+                name='tc1',
+                input={'query': {'name': 'Alice', 'hour': 9}},
+                expected={'status': 'ok'},
+            )],
+        )
+        client = MagicMock()
+        client.activate_workflow.return_value = {'active': True}
+        client.send_webhook.return_value = {'status': 'ok'}
+
+        result = deploy(spec, client, 'wf-1')
+
+        self.assertTrue(result['smoke_test_passed'])
+        client.send_webhook.assert_called_once_with(
+            'test-hook',
+            headers=None,
+            method='GET',
+            query={'name': 'Alice', 'hour': 9},
+        )
+
     def test_result_includes_workflow_id(self):
         spec = _make_spec()
         client = MagicMock()

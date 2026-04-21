@@ -5,6 +5,7 @@ Handles the GET-modify-PUT pattern since n8n has no PATCH endpoint.
 """
 import json
 import os
+import urllib.parse
 import urllib.request
 import urllib.error
 from typing import Any, Callable, Optional
@@ -53,7 +54,14 @@ class N8nClient:
         except urllib.error.URLError as e:
             raise N8nApiError(0, str(e.reason), url) from e
 
-    def _webhook_request(self, path: str, body: Any = None, headers: Optional[dict] = None) -> Any:
+    def _webhook_request(
+        self,
+        path: str,
+        body: Any = None,
+        headers: Optional[dict] = None,
+        method: str = 'POST',
+        query: Optional[dict] = None,
+    ) -> Any:
         """Send data to a webhook endpoint. Returns response body with http_status merged in.
 
         If the response body is a JSON object, returns {**body, 'http_status': code}.
@@ -62,15 +70,25 @@ class N8nClient:
         HTTP 4xx/5xx responses also return a dict (not raised) so test cases can
         match against status codes and error bodies.
 
+        `method`: HTTP method, defaults to POST. For GET, pass inputs via `query`.
+        `query`: dict of URL query parameters (GET) — stringified and url-encoded.
         `headers`: optional dict of extra request headers (e.g. auth).
         """
+        method = method.upper()
         url = f'{self.base_url}/webhook/{path}'
-        data = json.dumps(body).encode('utf-8') if body is not None else None
-        req_headers = {'Content-Type': 'application/json'} if data else {}
-        if headers:
-            req_headers.update(headers)
+        if query:
+            # n8n webhook nodes coerce query values to strings on ingest, so
+            # serialize here too. Lets test cases write hour: 9 and get the
+            # same shape as a real browser/curl client.
+            url = f'{url}?{urllib.parse.urlencode({k: str(v) for k, v in query.items()})}'
 
-        req = urllib.request.Request(url, data=data, headers=req_headers, method='POST')
+        req_headers = dict(headers) if headers else {}
+        data = None
+        if method != 'GET' and body is not None:
+            data = json.dumps(body).encode('utf-8')
+            req_headers.setdefault('Content-Type', 'application/json')
+
+        req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
 
         def _wrap(raw: bytes, status: int) -> Any:
             text = raw.decode('utf-8', errors='replace')
@@ -149,12 +167,21 @@ class N8nClient:
 
     # --- Webhooks ---
 
-    def send_webhook(self, path: str, data: Any = None, headers: Optional[dict] = None) -> Any:
+    def send_webhook(
+        self,
+        path: str,
+        data: Any = None,
+        headers: Optional[dict] = None,
+        method: str = 'POST',
+        query: Optional[dict] = None,
+    ) -> Any:
         """Send data to a workflow's webhook endpoint.
 
+        `method`: HTTP method; default POST. For GET triggers, pass `query=`
+            instead of `data=` — the URL gets ?k=v&... and no body is sent.
         `headers`: optional dict of extra request headers (e.g. auth).
         """
-        return self._webhook_request(path, data, headers=headers)
+        return self._webhook_request(path, data, headers=headers, method=method, query=query)
 
     # --- Executions ---
 
