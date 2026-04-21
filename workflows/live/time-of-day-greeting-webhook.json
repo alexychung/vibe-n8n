@@ -1,0 +1,274 @@
+{
+  "name": "Time-of-Day Greeting Webhook",
+  "nodes": [
+    {
+      "id": "trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        250,
+        300
+      ],
+      "parameters": {
+        "path": "greeting",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "authentication": "headerAuth"
+      },
+      "webhookId": "greeting-id",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PPmABgX1sM7jfoXM",
+          "name": "Time-of-Day Greeting Webhook \u2014 Webhook Trigger auth"
+        }
+      }
+    },
+    {
+      "id": "step_1",
+      "name": "Validate Inputs and Compute Greeting",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "jsCode": "try {\n  // Support both envelope ($json.body) and flat ($json) delivery modes\n  let body;\n  if ($json.body !== undefined && $json.body !== null && typeof $json.body === 'object') {\n    body = $json.body;\n  } else if (typeof $json === 'object' && $json !== null && ($json.name !== undefined || $json.hour !== undefined)) {\n    // Flat delivery: n8n merged body fields directly into $json\n    body = $json;\n  } else {\n    body = $json.body;\n  }\n\n  // Check if body could be parsed at all\n  if (body === undefined || body === null || typeof body !== 'object') {\n    return [{ json: { valid: false, errorMessage: 'Request body could not be parsed. Ensure Content-Type is application/json and body is valid JSON.' } }];\n  }\n\n  const name = body.name;\n  const hour = body.hour;\n\n  // Validate name\n  if (name === undefined || name === null || String(name).trim() === '') {\n    return [{ json: { valid: false, errorMessage: 'Missing or empty required field: name' } }];\n  }\n\n  // Validate hour\n  if (hour === undefined || hour === null) {\n    return [{ json: { valid: false, errorMessage: 'Missing required field: hour' } }];\n  }\n\n  // Strict integer check: must be a JSON number type and an integer.\n  // String values like '9' are explicitly rejected; clients must send a JSON number, not a string.\n  if (typeof hour !== 'number' || !Number.isInteger(hour) || hour < 0 || hour > 23) {\n    return [{ json: { valid: false, errorMessage: 'Invalid value for hour: must be a JSON number integer between 0 and 23 (not a string or float)' } }];\n  }\n\n  const hourNum = hour;\n\n  // Determine greeting\n  let period;\n  if (hourNum >= 5 && hourNum < 12) {\n    period = 'Morning';\n  } else if (hourNum >= 12 && hourNum < 18) {\n    period = 'Afternoon';\n  } else {\n    period = 'Evening';\n  }\n\n  const greeting = `Good ${period}, ${String(name).trim()}!`;\n  return [{ json: { valid: true, greeting, name: String(name).trim(), hour: hourNum, period } }];\n\n} catch (err) {\n  return [{ json: { valid: false, errorMessage: 'Internal error during input validation: ' + (err.message || String(err)) } }];\n}"
+      }
+    },
+    {
+      "id": "step_2",
+      "name": "Check Validation Result",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        750,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.valid }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_3",
+      "name": "Build Success Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1000,
+        300
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "http_status",
+              "value": 200,
+              "type": "number"
+            },
+            {
+              "id": "a1",
+              "name": "status",
+              "value": "success",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "greeting",
+              "value": "={{ $json.greeting }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "name",
+              "value": "={{ $json.name }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "hour",
+              "value": "={{ $json.hour }}",
+              "type": "number"
+            },
+            {
+              "id": "a5",
+              "name": "period",
+              "value": "={{ $json.period }}",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_4",
+      "name": "Respond 200 Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1250,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: $json.status, greeting: $json.greeting, name: $json.name, hour: $json.hour, period: $json.period }) }}",
+        "options": {
+          "responseCode": 200
+        },
+        "authentication": "headerAuth"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kkcPsQj3my9R5JLC",
+          "name": "Time-of-Day Greeting Webhook \u2014 Respond 200 Success auth"
+        }
+      }
+    },
+    {
+      "id": "step_6",
+      "name": "Respond 400 Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1500,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: $json.status, message: $json.message }) }}",
+        "options": {
+          "responseCode": 400
+        },
+        "authentication": "headerAuth"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "0CG8uoeLSm3ZU8eo",
+          "name": "Time-of-Day Greeting Webhook \u2014 Respond 400 Error auth"
+        }
+      }
+    },
+    {
+      "id": "step_5",
+      "name": "Build Error Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        750,
+        450
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "http_status",
+              "value": 400,
+              "type": "number"
+            },
+            {
+              "id": "a1",
+              "name": "status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "message",
+              "value": "={{ $json.errorMessage }}",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Validate Inputs and Compute Greeting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Inputs and Compute Greeting": {
+      "main": [
+        [
+          {
+            "node": "Check Validation Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Validation Result": {
+      "main": [
+        [
+          {
+            "node": "Build Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Success Response": {
+      "main": [
+        [
+          {
+            "node": "Respond 200 Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Error Response": {
+      "main": [
+        [
+          {
+            "node": "Respond 400 Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 10,
+    "saveExecutionProgress": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  }
+}
