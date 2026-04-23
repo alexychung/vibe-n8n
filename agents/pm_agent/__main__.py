@@ -5,10 +5,12 @@ Usage:
     python -m agents.pm_agent plan --from-brief brief.md      # Non-interactive
     python -m agents.pm_agent plan "desc" --output spec.json  # Custom output path
 """
+import datetime
 import io
 import json
 import os
 import sys
+import uuid
 
 # Fix Windows console encoding — LLM outputs Unicode (°, ≤, emoji) that
 # crashes the default cp1252 codec. Force UTF-8 on stdout/stderr.
@@ -43,17 +45,83 @@ def load_env():
         d = os.path.dirname(d)
 
 
-def cmd_plan(description: str = '', from_brief: str = '', output_path: str = ''):
+def _project_root():
+    d = os.path.dirname(__file__)
+    for _ in range(5):
+        if os.path.exists(os.path.join(d, '.env')) or os.path.exists(os.path.join(d, 'CLAUDE.md')):
+            return d
+        d = os.path.dirname(d)
+    return os.getcwd()
+
+
+def log_event(event: dict):
+    """Append one JSONL line to build-logs/pm-inputs.jsonl. Never raises."""
+    try:
+        log_path = os.path.join(_project_root(), 'build-logs', 'pm-inputs.jsonl')
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(event, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
+def cmd_plan(description: str = '', from_brief: str = '', output_path: str = '', requirements_path: str = ''):
     """Full PM pipeline: INTERVIEW → AUDIT → DECOMPOSE → REVIEW → VALIDATE → OUTPUT."""
 
-    # Phase 1: Interview
+    session_id = uuid.uuid4().hex[:12]
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        return _cmd_plan_inner(description, from_brief, output_path, session_id, now, requirements_path)
+    except BaseException as e:
+        log_event({
+            'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'session_id': session_id,
+            'kind': 'outcome',
+            'status': 'error' if not isinstance(e, KeyboardInterrupt) else 'interrupted',
+            'error_type': type(e).__name__,
+            'error': str(e),
+        })
+        raise
+
+
+def _cmd_plan_inner(description, from_brief, output_path, session_id, now, requirements_path=''):
+    # Phase 1: Interview (or load pre-computed requirements)
     print('Phase 1: Interview')
-    if from_brief:
+    if requirements_path:
+        with open(requirements_path, encoding='utf-8') as f:
+            requirements = json.load(f)
+        log_event({
+            'ts': now,
+            'session_id': session_id,
+            'kind': 'input',
+            'mode': 'requirements',
+            'requirements_path': requirements_path,
+            'output_path_arg': output_path or None,
+        })
+        print(f'  Loaded requirements from {requirements_path}')
+    elif from_brief:
         with open(from_brief) as f:
             brief_text = f.read()
+        log_event({
+            'ts': now,
+            'session_id': session_id,
+            'kind': 'input',
+            'mode': 'from-brief',
+            'brief_path': from_brief,
+            'brief_text': brief_text,
+            'output_path_arg': output_path or None,
+        })
         requirements = interview_from_brief(brief_text)
         print(f'  Inferred requirements from brief ({len(brief_text)} chars)')
     else:
+        log_event({
+            'ts': now,
+            'session_id': session_id,
+            'kind': 'input',
+            'mode': 'interactive',
+            'description': description,
+            'output_path_arg': output_path or None,
+        })
         requirements = interview_interactive(description)
     print(f'  Outcome: {requirements.get("outcome", "?")}')
     print(f'  Trigger: {requirements.get("trigger", "?")}')
@@ -95,6 +163,14 @@ def cmd_plan(description: str = '', from_brief: str = '', output_path: str = '')
         for e in errors:
             print(f'    - {e}')
         print('\nSpec has issues. Fix manually or re-run.')
+        log_event({
+            'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'session_id': session_id,
+            'kind': 'outcome',
+            'status': 'validation_failed',
+            'workflow_name': spec.get('workflow_name'),
+            'errors': errors,
+        })
         return 1
     print('  Spec is valid.')
     print()
@@ -104,12 +180,19 @@ def cmd_plan(description: str = '', from_brief: str = '', output_path: str = '')
         name_slug = spec.get('workflow_name', 'workflow').lower().replace(' ', '-')
         output_path = os.path.join('workflows', 'test-data', f'{name_slug}-spec.json')
 
-    # Confirm before writing (skip in non-interactive mode)
-    if not from_brief:
+    # Confirm before writing (skip in non-interactive modes)
+    if not from_brief and not requirements_path:
         print(f'Save to {output_path}? [Y/n]')
         confirm = input('> ').strip().lower()
         if confirm and confirm != 'y':
             print('Cancelled.')
+            log_event({
+                'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'session_id': session_id,
+                'kind': 'outcome',
+                'status': 'cancelled',
+                'workflow_name': spec.get('workflow_name'),
+            })
             return 1
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -119,6 +202,16 @@ def cmd_plan(description: str = '', from_brief: str = '', output_path: str = '')
     print(f'Spec saved to {output_path}')
     print(f'\nBuild it:')
     print(f'  python -m agents.build_agent build {output_path}')
+    log_event({
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'session_id': session_id,
+        'kind': 'outcome',
+        'status': 'success',
+        'workflow_name': spec.get('workflow_name'),
+        'output_path': output_path,
+        'step_count': len(spec.get('steps', [])),
+        'gate_count': len(spec.get('gates', [])),
+    })
     return 0
 
 
@@ -140,6 +233,7 @@ def main():
     description = ''
     from_brief = ''
     output_path = ''
+    requirements_path = ''
 
     i = 1
     while i < len(args):
@@ -149,6 +243,9 @@ def main():
         elif args[i] == '--output' and i + 1 < len(args):
             output_path = args[i + 1]
             i += 2
+        elif args[i] == '--requirements' and i + 1 < len(args):
+            requirements_path = args[i + 1]
+            i += 2
         elif not args[i].startswith('--'):
             description = args[i]
             i += 1
@@ -156,8 +253,8 @@ def main():
             print(f'Unknown flag: {args[i]}')
             return 1
 
-    if not description and not from_brief:
-        print('Error: Provide a description or --from-brief')
+    if not description and not from_brief and not requirements_path:
+        print('Error: Provide a description, --from-brief, or --requirements')
         return 1
 
     load_env()
@@ -167,7 +264,12 @@ def main():
         return 1
 
     try:
-        return cmd_plan(description=description, from_brief=from_brief, output_path=output_path)
+        return cmd_plan(
+            description=description,
+            from_brief=from_brief,
+            output_path=output_path,
+            requirements_path=requirements_path,
+        )
     except KeyboardInterrupt:
         print('\nCancelled.')
         return 1
