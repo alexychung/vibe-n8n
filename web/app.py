@@ -282,6 +282,153 @@ async def run_workflow(workflow_id: str, req: RunRequest):
     }
 
 
+# ---------- workflow controls + executions ----------
+
+async def n8n_request(method: str, path: str, body=None) -> Optional[dict]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        headers = {'X-N8N-API-KEY': N8N_API_KEY}
+        if body is not None:
+            headers['Content-Type'] = 'application/json'
+        r = await client.request(method, f'{N8N_BASE_URL}{path}', headers=headers, json=body)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f'n8n: {r.text}')
+        if r.status_code == 204 or not r.content:
+            return None
+        return r.json()
+
+
+@app.post('/api/workflows/{workflow_id}/activate')
+async def activate_workflow(workflow_id: str):
+    await n8n_request('POST', f'/api/v1/workflows/{workflow_id}/activate')
+    log_request({
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'kind': 'activate', 'workflow_id': workflow_id,
+    })
+    return {'ok': True, 'active': True}
+
+
+@app.post('/api/workflows/{workflow_id}/deactivate')
+async def deactivate_workflow(workflow_id: str):
+    await n8n_request('POST', f'/api/v1/workflows/{workflow_id}/deactivate')
+    log_request({
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'kind': 'deactivate', 'workflow_id': workflow_id,
+    })
+    return {'ok': True, 'active': False}
+
+
+@app.delete('/api/workflows/{workflow_id}')
+async def delete_workflow(workflow_id: str):
+    await n8n_request('DELETE', f'/api/v1/workflows/{workflow_id}')
+    log_request({
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'kind': 'delete', 'workflow_id': workflow_id,
+    })
+    return {'ok': True}
+
+
+@app.get('/api/workflows/{workflow_id}/executions')
+async def list_executions(workflow_id: str, limit: int = 20, include_data: bool = False):
+    limit = max(1, min(limit, 100))
+    qs = f'?workflowId={workflow_id}&limit={limit}'
+    if include_data:
+        qs += '&includeData=true'
+    data = await n8n_get(f'/api/v1/executions{qs}')
+    executions = data.get('data', []) if isinstance(data, dict) else []
+    out = []
+    for e in executions:
+        err = None
+        if include_data:
+            rd = (e.get('data') or {}).get('resultData') or {}
+            if isinstance(rd.get('error'), dict):
+                err_obj = rd['error']
+                err = {
+                    'node': (err_obj.get('node') or {}).get('name'),
+                    'message': err_obj.get('message'),
+                    'type': err_obj.get('name'),
+                }
+        # derive status — newer n8n returns `status`, older ones `finished` + `stoppedAt`
+        status = e.get('status')
+        if not status:
+            if not e.get('finished') and e.get('stoppedAt'):
+                status = 'error'
+            elif e.get('finished'):
+                status = 'success'
+            else:
+                status = 'running'
+        out.append({
+            'id': e.get('id'),
+            'mode': e.get('mode'),
+            'started_at': e.get('startedAt'),
+            'stopped_at': e.get('stoppedAt'),
+            'status': status,
+            'error': err,
+        })
+    return out
+
+
+# ---------- past specs ----------
+
+SPEC_DIRS = [
+    ('workflows/test-data', '*-spec.json', 'spec'),
+    ('workflows/live', '**/*.json', 'live'),
+]
+
+
+@app.get('/api/specs')
+async def list_specs():
+    """List JSON specs (rebuildable) and live workflow exports (read-only)."""
+    out = []
+    for rel_dir, pattern, kind in SPEC_DIRS:
+        root = PROJECT_ROOT / rel_dir
+        if not root.exists():
+            continue
+        for p in root.glob(pattern):
+            if not p.is_file():
+                continue
+            name = None
+            try:
+                head = p.read_text(encoding='utf-8', errors='replace')[:2048]
+                # PM-Agent specs use "workflow_name"; live n8n exports use "name"
+                for key in ('"workflow_name"', '"name"'):
+                    idx = head.find(key)
+                    if idx == -1:
+                        continue
+                    colon = head.find(':', idx)
+                    q1 = head.find('"', colon + 1)
+                    q2 = head.find('"', q1 + 1) if q1 != -1 else -1
+                    if q1 != -1 and q2 != -1:
+                        name = head[q1 + 1:q2]
+                        break
+            except Exception:
+                pass
+            rel = str(p.relative_to(PROJECT_ROOT)).replace('\\', '/')
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            out.append({
+                'path': rel,
+                'name': name or p.stem,
+                'size': st.st_size,
+                'mtime': st.st_mtime,
+                'kind': kind,
+            })
+    out.sort(key=lambda s: s['mtime'], reverse=True)
+    return out
+
+
+@app.get('/api/specs/content')
+async def spec_content(path: str):
+    sp = _safe_project_path(path)
+    if not sp.exists() or not sp.is_file():
+        raise HTTPException(404, 'spec not found')
+    try:
+        return json.loads(sp.read_text(encoding='utf-8'))
+    except json.JSONDecodeError as e:
+        raise HTTPException(400, f'invalid JSON: {e}')
+
+
 # ---------- SSE helpers ----------
 
 def _sse(kind: str, data) -> bytes:

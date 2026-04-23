@@ -9,9 +9,11 @@ function showTab(name) {
   $$('.tab').forEach(t => t.classList.toggle('active', t.id === `tab-${name}`));
   $$('.panel').forEach(p => p.classList.toggle('active', p.id === `panel-${name}`));
   if (name === 'run') loadWorkflows();
+  if (name === 'specs') loadSpecs();
 }
 $('#tab-plan').addEventListener('click', () => showTab('plan'));
 $('#tab-run').addEventListener('click', () => showTab('run'));
+$('#tab-specs').addEventListener('click', () => showTab('specs'));
 
 // ---------- plan mode toggle ----------
 function setPlanMode(mode) {
@@ -65,6 +67,13 @@ function selectWorkflow(wf, li) {
   $('#run-result').classList.add('hidden');
   $('#run-body').value = '';
   $('#run-headers').value = '';
+  // Toggle button reflects current state
+  const toggleBtn = $('#wf-toggle');
+  toggleBtn.textContent = wf.active ? 'Deactivate' : 'Activate';
+  toggleBtn.classList.toggle('danger', wf.active);
+
+  loadExecutions(wf.id);
+
   const webhooks = wf.webhooks || (wf.webhook ? [wf.webhook] : []);
   if (webhooks.length) {
     $('#wf-runner').classList.remove('hidden');
@@ -92,6 +101,85 @@ function selectWorkflow(wf, li) {
 }
 
 $('#refresh-wf').addEventListener('click', loadWorkflows);
+
+// ---------- activate/deactivate + delete ----------
+$('#wf-toggle').addEventListener('click', async () => {
+  if (!selectedWorkflow) return;
+  const btn = $('#wf-toggle');
+  const target = selectedWorkflow.active ? 'deactivate' : 'activate';
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/workflows/${selectedWorkflow.id}/${target}`, { method: 'POST' });
+    if (!r.ok) throw new Error(await r.text());
+    selectedWorkflow.active = !selectedWorkflow.active;
+    const badge = $('#wf-active');
+    badge.textContent = selectedWorkflow.active ? 'active' : 'inactive';
+    badge.className = `badge ${selectedWorkflow.active ? 'active' : 'inactive'}`;
+    btn.textContent = selectedWorkflow.active ? 'Deactivate' : 'Activate';
+    btn.classList.toggle('danger', selectedWorkflow.active);
+    // Refresh the list badge too
+    loadWorkflows();
+  } catch (e) {
+    alert(`${target} failed: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('#wf-delete').addEventListener('click', async () => {
+  if (!selectedWorkflow) return;
+  if (!confirm(`Delete "${selectedWorkflow.name}"? This cannot be undone.`)) return;
+  try {
+    const r = await fetch(`/api/workflows/${selectedWorkflow.id}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error(await r.text());
+    selectedWorkflow = null;
+    $('#wf-view').classList.add('hidden');
+    $('#wf-empty').classList.remove('hidden');
+    loadWorkflows();
+  } catch (e) {
+    alert(`Delete failed: ${e.message}`);
+  }
+});
+
+// ---------- executions ----------
+async function loadExecutions(workflowId) {
+  const ul = $('#executions');
+  ul.innerHTML = '<li class="hint">Loading…</li>';
+  try {
+    const r = await fetch(`/api/workflows/${workflowId}/executions?limit=15&include_data=true`);
+    if (!r.ok) throw new Error(await r.text());
+    const execs = await r.json();
+    ul.innerHTML = '';
+    if (!execs.length) { ul.innerHTML = '<li class="hint">No executions yet.</li>'; return; }
+    for (const e of execs) {
+      const li = document.createElement('li');
+      li.className = `exec exec-${e.status}`;
+      const when = e.started_at ? new Date(e.started_at).toLocaleString() : '—';
+      const dur = (e.started_at && e.stopped_at)
+        ? `${((new Date(e.stopped_at) - new Date(e.started_at)) / 1000).toFixed(1)}s`
+        : '';
+      const errBlock = e.error
+        ? `<div class="exec-err"><strong>${escapeHtml(e.error.node || '')}</strong>: ${escapeHtml(e.error.message || '')}</div>`
+        : '';
+      li.innerHTML = `
+        <div class="exec-row">
+          <span class="badge ${e.status}">${e.status}</span>
+          <span class="exec-mode">${escapeHtml(e.mode || '')}</span>
+          <span class="exec-when">${escapeHtml(when)}</span>
+          <span class="exec-dur">${dur}</span>
+        </div>
+        ${errBlock}
+      `;
+      ul.appendChild(li);
+    }
+  } catch (e) {
+    ul.innerHTML = `<li class="hint">Error: ${escapeHtml(String(e))}</li>`;
+  }
+}
+
+$('#refresh-execs').addEventListener('click', () => {
+  if (selectedWorkflow) loadExecutions(selectedWorkflow.id);
+});
 
 // ---------- run workflow ----------
 $('#run-button').addEventListener('click', async () => {
@@ -417,6 +505,111 @@ $('#mic').addEventListener('click', () => {
 });
 $('#iv-mic-desc').addEventListener('click', () => {
   recordIntoTextarea($('#iv-mic-desc'), $('#iv-description'), $('#iv-mic-desc-status'));
+});
+
+// ---------- specs tab ----------
+let selectedSpec = null;
+
+async function loadSpecs() {
+  const ul = $('#specs');
+  ul.innerHTML = '<li class="hint">Loading…</li>';
+  try {
+    const r = await fetch('/api/specs');
+    if (!r.ok) throw new Error(await r.text());
+    const specs = await r.json();
+    ul.innerHTML = '';
+    if (!specs.length) { ul.innerHTML = '<li class="hint">No specs yet.</li>'; return; }
+    for (const s of specs) {
+      const li = document.createElement('li');
+      li.dataset.path = s.path;
+      const when = s.mtime ? new Date(s.mtime * 1000).toLocaleString() : '';
+      li.innerHTML = `
+        <div>
+          <span class="name" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>
+          <span class="badge ${s.kind === 'live' ? 'inactive' : 'active'}">${s.kind}</span>
+        </div>
+        <div class="hint small">${escapeHtml(when)}</div>
+      `;
+      li.addEventListener('click', () => selectSpec(s, li));
+      ul.appendChild(li);
+    }
+  } catch (e) {
+    ul.innerHTML = `<li class="hint">Error: ${escapeHtml(String(e))}</li>`;
+  }
+}
+
+async function selectSpec(s, li) {
+  selectedSpec = s;
+  $$('#specs li').forEach(x => x.classList.remove('selected'));
+  li.classList.add('selected');
+  $('#spec-empty').classList.add('hidden');
+  $('#spec-view').classList.remove('hidden');
+  $('#spec-name').textContent = s.name;
+  $('#spec-path').textContent = s.path;
+  const kindBadge = $('#spec-kind');
+  kindBadge.textContent = s.kind;
+  kindBadge.className = `badge ${s.kind === 'live' ? 'inactive' : 'active'}`;
+  $('#spec-content').textContent = 'Loading…';
+  $('#spec-build-box').classList.add('hidden');
+  $('#spec-build').disabled = s.kind === 'live';
+  $('#spec-build').title = s.kind === 'live' ? 'Live exports are not rebuildable' : '';
+
+  try {
+    const r = await fetch(`/api/specs/content?path=${encodeURIComponent(s.path)}`);
+    if (!r.ok) { $('#spec-content').textContent = `Error: ${await r.text()}`; return; }
+    const data = await r.json();
+    $('#spec-content').textContent = JSON.stringify(data, null, 2);
+  } catch (e) {
+    $('#spec-content').textContent = `Error: ${e.message}`;
+  }
+}
+
+$('#refresh-specs').addEventListener('click', loadSpecs);
+
+$('#spec-copy').addEventListener('click', async () => {
+  const text = $('#spec-content').textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    $('#spec-copy').textContent = 'Copied ✓';
+    setTimeout(() => { $('#spec-copy').textContent = 'Copy JSON'; }, 1500);
+  } catch (e) { alert(`Copy failed: ${e.message}`); }
+});
+
+$('#spec-build').addEventListener('click', async () => {
+  if (!selectedSpec || selectedSpec.kind === 'live') return;
+  const log = $('#spec-build-log');
+  log.textContent = '';
+  $('#spec-build-box').classList.remove('hidden');
+  $('#spec-build-done').classList.add('hidden');
+  const btn = $('#spec-build');
+  btn.disabled = true;
+  btn.textContent = 'Building…';
+  try {
+    const r = await fetch('/api/build', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ spec_path: selectedSpec.path }),
+    });
+    if (!r.ok) { log.textContent = `Error: ${await r.text()}`; return; }
+    await consumeSSE(r.body, (evt, data) => {
+      if (evt === 'log') {
+        log.textContent += data.line + '\n';
+        log.scrollTop = log.scrollHeight;
+      } else if (evt === 'done') {
+        log.textContent += `\n[exit ${data.exit_code}]\n`;
+        if (data.workflow_id) {
+          $('#spec-build-done').classList.remove('hidden');
+          $('#spec-build-wf-id').textContent = data.workflow_id;
+          $('#spec-build-wf-link').href = data.edit_url || '#';
+        }
+      }
+    });
+  } catch (e) {
+    log.textContent += `\nRequest failed: ${e.message}\n`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Build this →';
+  }
 });
 
 // ---------- utils ----------

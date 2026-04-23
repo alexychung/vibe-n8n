@@ -12,6 +12,7 @@
     <nav>
       <button id="tab-plan" class="tab active">Plan</button>
       <button id="tab-run" class="tab">Workflows</button>
+      <button id="tab-specs" class="tab">Specs</button>
     </nav>
   </header>
 
@@ -106,6 +107,8 @@
             <div class="wf-meta">
               <span id="wf-active" class="badge"></span>
               <a id="wf-edit" target="_blank" rel="noopener">Open in n8n →</a>
+              <button id="wf-toggle" class="small-btn">Activate</button>
+              <button id="wf-delete" class="small-btn danger">Delete</button>
             </div>
             <div id="wf-runner" class="hidden">
               <h3>Run this workflow</h3>
@@ -133,6 +136,53 @@
               </div>
             </div>
             <div id="wf-norunner" class="hidden hint">This workflow has no webhook trigger — run it from the n8n UI.</div>
+
+            <div id="wf-executions" class="exec-box">
+              <div class="exec-header">
+                <h3>Recent executions</h3>
+                <button id="refresh-execs" class="small-btn">↻</button>
+              </div>
+              <ul id="executions"></ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SPECS TAB -->
+    <section id="panel-specs" class="panel">
+      <div class="run-grid">
+        <aside class="wf-list">
+          <div class="wf-list-header">
+            <h2>Past specs</h2>
+            <button id="refresh-specs" title="Refresh">↻</button>
+          </div>
+          <ul id="specs"></ul>
+        </aside>
+        <div class="wf-detail">
+          <div id="spec-empty" class="empty">Select a spec</div>
+          <div id="spec-view" class="hidden">
+            <h2 id="spec-name"></h2>
+            <div class="wf-meta">
+              <span id="spec-kind" class="badge"></span>
+              <code id="spec-path"></code>
+            </div>
+            <div class="btn-row">
+              <button id="spec-build" class="primary">Build this →</button>
+              <button id="spec-copy">Copy JSON</button>
+            </div>
+            <details open>
+              <summary>Spec JSON</summary>
+              <pre id="spec-content" class="log"></pre>
+            </details>
+            <div id="spec-build-box" class="hidden">
+              <h3>Build output</h3>
+              <pre id="spec-build-log" class="log"></pre>
+              <div id="spec-build-done" class="result hidden">
+                <p>Workflow deployed: <code id="spec-build-wf-id"></code></p>
+                <a id="spec-build-wf-link" target="_blank" rel="noopener">Open in n8n →</a>
+              </div>
+            </div>
           </div>
         </div>
       </div>
