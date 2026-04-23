@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vibe-n8n</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>vibe-n8n</h1>
+    <nav>
+      <button id="tab-plan" class="tab active">Plan</button>
+      <button id="tab-run" class="tab">Workflows</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- PLAN TAB -->
+    <section id="panel-plan" class="panel active">
+      <div class="plan-grid">
+        <div class="plan-input">
+          <div class="mode-row">
+            <span class="mode-label">Mode:</span>
+            <button id="mode-brief" class="mode-btn active">Brief (one-shot)</button>
+            <button id="mode-interview" class="mode-btn">Interview (conversation)</button>
+          </div>
+
+          <!-- BRIEF mode -->
+          <div id="brief-view">
+            <h2>Describe your workflow</h2>
+            <p class="hint">Speak or type what the workflow should do. The PM Agent will draft a spec.</p>
+            <textarea id="brief" rows="8" placeholder="e.g. Every morning at 7am, check SAM.gov for new federal contracts matching our keywords, score them with an LLM, and email a ranked digest to the sales team."></textarea>
+            <div class="mic-row">
+              <button id="mic" class="mic">🎙 Record</button>
+              <span id="mic-status"></span>
+            </div>
+            <button id="submit-plan" class="primary">Plan this workflow</button>
+          </div>
+
+          <!-- INTERVIEW mode -->
+          <div id="interview-view" class="hidden">
+            <h2>Start with a rough description</h2>
+            <p class="hint">The agent will fill in what it can and ask clarifying questions one at a time.</p>
+            <textarea id="iv-description" rows="5" placeholder="e.g. Daily Stripe sales summary by email"></textarea>
+            <div class="mic-row">
+              <button id="iv-mic-desc" class="mic" data-target="iv-description">🎙 Record</button>
+              <span id="iv-mic-desc-status"></span>
+            </div>
+            <button id="iv-start" class="primary">Start interview</button>
+
+            <div id="iv-chat" class="hidden">
+              <h3>Inferred so far</h3>
+              <pre id="iv-inferred" class="log small"></pre>
+
+              <h3>Questions</h3>
+              <ol id="iv-questions"></ol>
+
+              <button id="iv-finish" class="primary" disabled>Finish interview → generate spec</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="plan-output">
+          <h2>Agent output</h2>
+          <pre id="plan-log" class="log"></pre>
+          <div id="plan-result" class="result hidden">
+            <h3>Spec generated</h3>
+            <p><code id="plan-spec-path"></code></p>
+            <details>
+              <summary>View spec JSON</summary>
+              <pre id="plan-spec"></pre>
+            </details>
+            <div class="btn-row">
+              <button id="copy-spec">Copy JSON</button>
+              <button id="build-spec" class="primary">Build this →</button>
+            </div>
+          </div>
+
+          <div id="build-box" class="hidden">
+            <h3>Build output</h3>
+            <pre id="build-log" class="log"></pre>
+            <div id="build-done" class="result hidden">
+              <p>Workflow deployed: <code id="build-wf-id"></code></p>
+              <a id="build-wf-link" target="_blank" rel="noopener">Open in n8n →</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RUN TAB -->
+    <section id="panel-run" class="panel">
+      <div class="run-grid">
+        <aside class="wf-list">
+          <div class="wf-list-header">
+            <h2>Workflows</h2>
+            <button id="refresh-wf" title="Refresh">↻</button>
+          </div>
+          <ul id="workflows"></ul>
+        </aside>
+        <div class="wf-detail">
+          <div id="wf-empty" class="empty">Select a workflow</div>
+          <div id="wf-view" class="hidden">
+            <h2 id="wf-name"></h2>
+            <div class="wf-meta">
+              <span id="wf-active" class="badge"></span>
+              <a id="wf-edit" target="_blank" rel="noopener">Open in n8n →</a>
+            </div>
+            <div id="wf-runner" class="hidden">
+              <h3>Run this workflow</h3>
+              <div class="runner-row">
+                <label>Mode
+                  <select id="run-mode">
+                    <option value="production">production (/webhook)</option>
+                    <option value="test">test (/webhook-test)</option>
+                  </select>
+                </label>
+                <label id="wf-webhook-picker-wrap" class="hidden">Webhook
+                  <select id="wf-webhook-picker"></select>
+                </label>
+                <span id="wf-webhook-info" class="hint"></span>
+              </div>
+              <label>Headers (JSON) — e.g. <code>{"X-Auth-Token":"..."}</code></label>
+              <textarea id="run-headers" rows="2" placeholder="{}"></textarea>
+              <label>Body (JSON)</label>
+              <textarea id="run-body" rows="5" placeholder="{}"></textarea>
+              <button id="run-button" class="primary">Run</button>
+              <div id="run-result" class="hidden">
+                <h4>Response</h4>
+                <p>Status: <code id="run-status"></code></p>
+                <pre id="run-body-response" class="log"></pre>
+              </div>
+            </div>
+            <div id="wf-norunner" class="hidden hint">This workflow has no webhook trigger — run it from the n8n UI.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+<script src="/static/app.js"></script>
+</html>

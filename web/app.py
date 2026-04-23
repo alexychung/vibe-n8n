@@ -1,0 +1,629 @@
+"""FastAPI wrapper around n8n + the PM/Build agents.
+
+Serves a minimal frontend at `/`, plus:
+  GET  /api/config                  — public config (n8n URL for browser links)
+  GET  /api/workflows               — list workflows (+ webhook trigger info)
+  POST /api/workflows/{id}/run      — fire a webhook-triggered workflow
+  POST /api/plan                    — SSE stream of PM Agent output
+  POST /api/stt                     — transcribe audio via OpenAI Whisper
+  GET  /api/health                  — health check for Railway
+
+Environment:
+  N8N_BASE_URL        — where the backend talks to n8n (may be internal)
+  N8N_PUBLIC_URL      — what the browser uses for deep-links (defaults to N8N_BASE_URL)
+  N8N_API_KEY         — n8n API key
+  ANTHROPIC_API_KEY   — for the PM Agent
+  OPENAI_API_KEY      — for Whisper
+"""
+import asyncio
+import base64
+import datetime
+import json
+import os
+import pathlib
+import secrets
+import sys
+import tempfile
+import uuid
+from typing import Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
+STATIC_DIR = pathlib.Path(__file__).resolve().parent / 'static'
+LOG_PATH = PROJECT_ROOT / 'build-logs' / 'web-requests.jsonl'
+
+# Expose pm_agent modules so we can reuse the LLM helpers for the interactive
+# interview. pm_agent uses bare imports (`from llm import ...`) and expects its
+# directory on sys.path.
+sys.path.insert(0, str(PROJECT_ROOT / 'agents' / 'pm_agent'))
+
+
+def load_env():
+    """Load .env from project root if not already set."""
+    env_path = PROJECT_ROOT / '.env'
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, v = line.split('=', 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+load_env()
+
+N8N_BASE_URL = os.environ.get('N8N_BASE_URL', 'http://localhost:5678').rstrip('/')
+N8N_PUBLIC_URL = os.environ.get('N8N_PUBLIC_URL', N8N_BASE_URL).rstrip('/')
+N8N_API_KEY = os.environ.get('N8N_API_KEY', '')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+
+# Shared-secret Basic Auth. If WEB_AUTH_PASSWORD is unset, the app is open
+# (intended for local dev). Optional WEB_AUTH_USER defaults to "admin".
+WEB_AUTH_PASSWORD = os.environ.get('WEB_AUTH_PASSWORD', '')
+WEB_AUTH_USER = os.environ.get('WEB_AUTH_USER', 'admin')
+
+app = FastAPI(title='vibe-n8n')
+
+
+class BasicAuthMiddleware(BaseHTTPMiddleware):
+    """HTTP Basic Auth gate. Leaves /api/health open for Railway healthchecks."""
+
+    OPEN_PATHS = {'/api/health'}
+
+    async def dispatch(self, request: Request, call_next):
+        if not WEB_AUTH_PASSWORD:
+            return await call_next(request)
+        if request.url.path in self.OPEN_PATHS:
+            return await call_next(request)
+
+        auth = request.headers.get('authorization', '')
+        if auth.startswith('Basic '):
+            try:
+                decoded = base64.b64decode(auth[6:]).decode('utf-8', errors='replace')
+                user, _, pw = decoded.partition(':')
+                if secrets.compare_digest(user, WEB_AUTH_USER) and secrets.compare_digest(pw, WEB_AUTH_PASSWORD):
+                    return await call_next(request)
+            except Exception:
+                pass
+
+        return Response(
+            status_code=401,
+            content='Authentication required',
+            headers={'WWW-Authenticate': 'Basic realm="vibe-n8n"'},
+        )
+
+
+app.add_middleware(BasicAuthMiddleware)
+
+
+def _log_request_sync(event: dict):
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open('a', encoding='utf-8') as f:
+            f.write(json.dumps(event, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
+def log_request(event: dict):
+    """Fire-and-forget log write. Runs in a thread to avoid blocking the
+    event loop; safe to call from sync code too (falls back to a direct
+    write when no loop is running)."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _log_request_sync(event)
+        return
+    loop.run_in_executor(None, _log_request_sync, event)
+
+
+# ---------- n8n client ----------
+
+async def n8n_get(path: str) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f'{N8N_BASE_URL}{path}',
+            headers={'X-N8N-API-KEY': N8N_API_KEY},
+        )
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f'n8n: {r.text}')
+        return r.json()
+
+
+def extract_webhook_infos(workflow: dict) -> list[dict]:
+    """Return all webhook-trigger entries in the workflow.
+
+    Each entry: {path, method, production_url, test_url, node_name}.
+    Returns [] if the workflow has no webhook triggers.
+    """
+    out = []
+    for node in workflow.get('nodes', []):
+        if node.get('type') != 'n8n-nodes-base.webhook':
+            continue
+        params = node.get('parameters', {}) or {}
+        path = params.get('path', '')
+        if not path:
+            continue
+        method = (params.get('httpMethod') or 'POST').upper()
+        out.append({
+            'path': path,
+            'method': method,
+            'production_url': f'{N8N_PUBLIC_URL}/webhook/{path}',
+            'test_url': f'{N8N_PUBLIC_URL}/webhook-test/{path}',
+            'node_name': node.get('name', ''),
+        })
+    return out
+
+
+def extract_webhook_info(workflow: dict) -> Optional[dict]:
+    """Back-compat: return the first webhook only. Prefer extract_webhook_infos."""
+    infos = extract_webhook_infos(workflow)
+    return infos[0] if infos else None
+
+
+# ---------- routes ----------
+
+@app.get('/api/health')
+def health():
+    return {'ok': True, 'n8n_base_url': N8N_BASE_URL}
+
+
+@app.get('/api/config')
+def config():
+    return {
+        'n8n_public_url': N8N_PUBLIC_URL,
+        'has_openai': bool(OPENAI_API_KEY),
+        'has_anthropic': bool(os.environ.get('ANTHROPIC_API_KEY')),
+    }
+
+
+@app.get('/api/workflows')
+async def list_workflows():
+    data = await n8n_get('/api/v1/workflows')
+    workflows = data.get('data', [])
+    out = []
+    for w in workflows:
+        webhooks = extract_webhook_infos(w)
+        out.append({
+            'id': w.get('id'),
+            'name': w.get('name'),
+            'active': bool(w.get('active')),
+            'updated_at': w.get('updatedAt'),
+            'webhook': webhooks[0] if webhooks else None,  # compat
+            'webhooks': webhooks,
+            'edit_url': f'{N8N_PUBLIC_URL}/workflow/{w.get("id")}',
+        })
+    return out
+
+
+@app.get('/api/workflows/{workflow_id}')
+async def get_workflow(workflow_id: str):
+    w = await n8n_get(f'/api/v1/workflows/{workflow_id}')
+    webhooks = extract_webhook_infos(w)
+    return {
+        'id': w.get('id'),
+        'name': w.get('name'),
+        'active': bool(w.get('active')),
+        'webhook': webhooks[0] if webhooks else None,  # compat
+        'webhooks': webhooks,
+        'node_count': len(w.get('nodes', [])),
+        'edit_url': f'{N8N_PUBLIC_URL}/workflow/{w.get("id")}',
+    }
+
+
+class RunRequest(BaseModel):
+    body: Optional[dict] = None
+    query: Optional[dict] = None
+    headers: Optional[dict] = None
+    mode: str = 'production'  # 'production' or 'test'
+    webhook_index: int = 0   # which webhook to fire (when multiple)
+
+
+@app.post('/api/workflows/{workflow_id}/run')
+async def run_workflow(workflow_id: str, req: RunRequest):
+    """Fire a webhook-triggered workflow. Only works for webhook-triggered workflows."""
+    w = await n8n_get(f'/api/v1/workflows/{workflow_id}')
+    webhooks = extract_webhook_infos(w)
+    if not webhooks:
+        raise HTTPException(400, 'Workflow has no webhook trigger — run it from the n8n UI instead.')
+    if req.webhook_index < 0 or req.webhook_index >= len(webhooks):
+        raise HTTPException(400, f'webhook_index {req.webhook_index} out of range (0..{len(webhooks)-1})')
+    webhook = webhooks[req.webhook_index]
+    if req.mode == 'production' and not w.get('active'):
+        raise HTTPException(400, 'Workflow is not active. Activate it in n8n, or use mode=test.')
+
+    url = webhook['production_url'] if req.mode == 'production' else webhook['test_url']
+    method = webhook['method']
+    headers = dict(req.headers or {})
+
+    log_request({
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'kind': 'run_workflow',
+        'workflow_id': workflow_id,
+        'mode': req.mode,
+        'method': method,
+    })
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            if method == 'GET':
+                r = await client.get(url, params=req.query or {}, headers=headers)
+            else:
+                r = await client.request(
+                    method,
+                    url,
+                    json=req.body if req.body is not None else {},
+                    params=req.query or {},
+                    headers=headers,
+                )
+        except httpx.RequestError as e:
+            raise HTTPException(502, f'Webhook call failed: {e}')
+
+    content_type = r.headers.get('content-type', '')
+    body: object
+    if 'application/json' in content_type:
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+    else:
+        body = r.text
+
+    return {
+        'status': r.status_code,
+        'headers': dict(r.headers),
+        'body': body,
+    }
+
+
+# ---------- SSE helpers ----------
+
+def _sse(kind: str, data) -> bytes:
+    payload = data if isinstance(data, str) else json.dumps(data)
+    return f'event: {kind}\ndata: {payload}\n\n'.encode('utf-8')
+
+
+async def _stream_subprocess(cmd: list[str]):
+    """Yield SSE 'log' lines from a subprocess's merged stdout/stderr, ending
+    with a synthetic ('_exit', returncode) tuple. On client disconnect the
+    subprocess is terminated so it doesn't keep running — important for LLM
+    calls that cost money.
+    """
+    env = os.environ.copy()
+    env['PYTHONIOENCODING'] = 'utf-8'
+    env['PYTHONUNBUFFERED'] = '1'
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    assert proc.stdout is not None
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode('utf-8', errors='replace').rstrip('\r\n')
+            yield ('log', {'line': text})
+        rc = await proc.wait()
+        yield ('_exit', rc)
+    finally:
+        # Handles both normal completion (no-op) and client disconnect.
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+
+
+def _safe_project_path(rel: str) -> pathlib.Path:
+    """Resolve a user-supplied project-relative path, reject traversal."""
+    candidate = (PROJECT_ROOT / rel).resolve()
+    try:
+        candidate.relative_to(PROJECT_ROOT.resolve())
+    except ValueError:
+        raise HTTPException(400, f'Path escapes project root: {rel}')
+    return candidate
+
+
+# ---------- PM Agent streaming ----------
+
+class PlanRequest(BaseModel):
+    brief: Optional[str] = None
+    requirements_path: Optional[str] = None
+
+
+@app.post('/api/plan')
+async def plan(req: PlanRequest):
+    """Run PM Agent on the provided brief OR pre-computed requirements JSON.
+
+    Streams stdout lines as SSE events. Final `done` event carries the spec.
+    """
+    session_id = uuid.uuid4().hex[:12]
+    spec_path = PROJECT_ROOT / 'workflows' / 'test-data' / f'web-{session_id}-spec.json'
+    spec_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if req.requirements_path:
+        rp = _safe_project_path(req.requirements_path)
+        if not rp.exists():
+            raise HTTPException(400, f'requirements file not found: {req.requirements_path}')
+        cmd = [
+            sys.executable, '-m', 'agents.pm_agent', 'plan',
+            '--requirements', str(rp),
+            '--output', str(spec_path),
+        ]
+        input_kind = 'requirements'
+    elif req.brief and req.brief.strip():
+        brief = req.brief.strip()
+        brief_path = PROJECT_ROOT / 'build-logs' / f'web-brief-{session_id}.md'
+        brief_path.parent.mkdir(parents=True, exist_ok=True)
+        brief_path.write_text(brief, encoding='utf-8')
+        cmd = [
+            sys.executable, '-m', 'agents.pm_agent', 'plan',
+            '--from-brief', str(brief_path),
+            '--output', str(spec_path),
+        ]
+        input_kind = 'brief'
+    else:
+        raise HTTPException(400, 'brief or requirements_path is required')
+
+    log_request({
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'kind': 'plan',
+        'session_id': session_id,
+        'input_kind': input_kind,
+    })
+
+    async def event_stream():
+        yield _sse('session', {'session_id': session_id})
+        rc = None
+        async for kind, payload in _stream_subprocess(cmd):
+            if kind == '_exit':
+                rc = payload
+            else:
+                yield _sse(kind, payload)
+
+        if rc == 0 and spec_path.exists():
+            try:
+                spec = json.loads(spec_path.read_text(encoding='utf-8'))
+            except Exception as e:
+                yield _sse('error', {'message': f'Failed to read spec: {e}'})
+                return
+            yield _sse('done', {
+                'exit_code': rc,
+                'spec_path': str(spec_path.relative_to(PROJECT_ROOT)).replace('\\', '/'),
+                'spec': spec,
+            })
+        else:
+            yield _sse('done', {'exit_code': rc, 'spec_path': None})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
+
+# ---------- Build Agent streaming ----------
+
+class BuildRequest(BaseModel):
+    spec_path: str
+    dry_run: bool = False
+
+
+WORKFLOW_ID_RE = None  # compiled lazily
+
+
+@app.post('/api/build')
+async def build(req: BuildRequest):
+    """Run Build Agent on a spec file. Streams stdout as SSE. Final event includes workflow_id."""
+    import re
+    global WORKFLOW_ID_RE
+    if WORKFLOW_ID_RE is None:
+        WORKFLOW_ID_RE = re.compile(r'Workflow deployed:\s*(\S+)')
+
+    sp = _safe_project_path(req.spec_path)
+    if not sp.exists():
+        raise HTTPException(400, f'spec not found: {req.spec_path}')
+
+    cmd = [sys.executable, '-m', 'agents.build_agent', 'build', str(sp)]
+    if req.dry_run:
+        cmd.append('--dry-run')
+
+    log_request({
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'kind': 'build',
+        'spec_path': req.spec_path,
+        'dry_run': req.dry_run,
+    })
+
+    async def event_stream():
+        workflow_id = None
+        rc = None
+        async for kind, payload in _stream_subprocess(cmd):
+            if kind == '_exit':
+                rc = payload
+            else:
+                yield _sse(kind, payload)
+                if workflow_id is None:
+                    m = WORKFLOW_ID_RE.search(payload.get('line', ''))
+                    if m:
+                        workflow_id = m.group(1)
+
+        edit_url = f'{N8N_PUBLIC_URL}/workflow/{workflow_id}' if workflow_id else None
+        yield _sse('done', {
+            'exit_code': rc,
+            'workflow_id': workflow_id,
+            'edit_url': edit_url,
+        })
+
+    return StreamingResponse(
+        event_stream(),
+        media_type='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
+
+# ---------- Interactive interview ----------
+
+INTERVIEW_MODEL = 'claude-haiku-4-5-20251001'
+
+
+class InterviewStartRequest(BaseModel):
+    description: str
+
+
+class InterviewFinishRequest(BaseModel):
+    description: str
+    inferred: dict
+    answers: dict  # {"q1": "...", "q2": "..."}
+
+
+def _import_pm_llm():
+    try:
+        from llm import call_json, load_prompt  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise HTTPException(500, f'pm_agent llm import failed: {e}')
+    return call_json, load_prompt
+
+
+@app.post('/api/interview/start')
+async def interview_start(req: InterviewStartRequest):
+    """First step: LLM infers what it can, returns remaining questions."""
+    if not req.description.strip():
+        raise HTTPException(400, 'description is required')
+    call_json, load_prompt = _import_pm_llm()
+
+    def _call():
+        system = load_prompt('interview')
+        return call_json(INTERVIEW_MODEL, system, req.description)
+
+    try:
+        result = await asyncio.to_thread(_call)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(500, f'prompt template missing: {e}')
+
+    log_request({
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'kind': 'interview_start',
+        'description_len': len(req.description),
+        'question_count': len(result.get('questions_to_ask', [])),
+    })
+    return {
+        'inferred': result.get('inferred', {}),
+        'questions': result.get('questions_to_ask', []),
+    }
+
+
+@app.post('/api/interview/finish')
+async def interview_finish(req: InterviewFinishRequest):
+    """Second step: consolidate inferred + answers into a requirements JSON file."""
+    call_json, load_prompt = _import_pm_llm()
+
+    def _call():
+        system = load_prompt('interview')
+        consolidate_prompt = (
+            f'Original description: {req.description}\n\n'
+            f'Inferred answers: {json.dumps(req.inferred)}\n\n'
+            f'User answers to follow-up questions: {json.dumps(req.answers)}\n\n'
+            'Produce the final structured requirements as JSON with these fields:\n'
+            'outcome, trigger, stakes, success_criteria, systems, volume, budget, editors\n'
+            "All fields should be filled in. Use inferred values where the user confirmed or didn't contradict."
+        )
+        return call_json(INTERVIEW_MODEL, system, consolidate_prompt)
+
+    try:
+        requirements = await asyncio.to_thread(_call)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(500, f'prompt template missing: {e}')
+
+    session_id = uuid.uuid4().hex[:12]
+    req_path = PROJECT_ROOT / 'build-logs' / f'web-requirements-{session_id}.json'
+    req_path.parent.mkdir(parents=True, exist_ok=True)
+    req_path.write_text(json.dumps(requirements, indent=2), encoding='utf-8')
+
+    log_request({
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'kind': 'interview_finish',
+        'session_id': session_id,
+        'requirements_path': str(req_path.relative_to(PROJECT_ROOT)).replace('\\', '/'),
+    })
+    return {
+        'requirements': requirements,
+        'requirements_path': str(req_path.relative_to(PROJECT_ROOT)).replace('\\', '/'),
+        'session_id': session_id,
+    }
+
+
+# ---------- Whisper STT ----------
+
+@app.post('/api/stt')
+async def stt(audio: UploadFile = File(...)):
+    if not OPENAI_API_KEY:
+        raise HTTPException(503, 'OPENAI_API_KEY not set')
+    contents = await audio.read()
+    if len(contents) == 0:
+        raise HTTPException(400, 'empty audio')
+
+    suffix = pathlib.Path(audio.filename or '').suffix or '.webm'
+    filename = f'audio{suffix}'
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        files = {
+            'file': (filename, contents, audio.content_type or 'application/octet-stream'),
+            'model': (None, 'whisper-1'),
+        }
+        r = await client.post(
+            'https://api.openai.com/v1/audio/transcriptions',
+            headers={'Authorization': f'Bearer {OPENAI_API_KEY}'},
+            files=files,
+        )
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, f'whisper: {r.text}')
+    data = r.json()
+    transcript = data.get('text', '')
+    log_request({
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'kind': 'stt',
+        'bytes': len(contents),
+        'transcript_len': len(transcript),
+    })
+    return {'text': transcript}
+
+
+# ---------- static ----------
+
+if STATIC_DIR.exists():
+    app.mount('/static', StaticFiles(directory=str(STATIC_DIR)), name='static')
+
+
+@app.get('/')
+def index():
+    index_path = STATIC_DIR / 'index.html'
+    if not index_path.exists():
+        return JSONResponse({'error': 'index.html not found'}, status_code=500)
+    return FileResponse(str(index_path))
