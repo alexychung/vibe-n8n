@@ -110,7 +110,37 @@ def _fix_boolean_conditions_n8n(spec_params: dict) -> dict:
         if cond.get('operator', {}).get('type') == 'boolean':
             cond['leftValue'] = _unwrap_string_cast(cond.get('leftValue', ''))
 
+        # Coerce numeric rightValue to a native number — n8n IF v2 rejects
+        # stringy "0"/"100" when operator.type == 'number'.
+        op_after = cond.get('operator', {})
+        if op_after.get('type') == 'number' and 'rightValue' in cond:
+            cond['rightValue'] = _coerce_number(cond['rightValue'])
+
     return spec_params
+
+
+def _coerce_number(value):
+    """Convert a value to int or float for IF v2 numeric comparisons.
+
+    Accepts int/float/bool/str. Falls through to str(value) if not parseable,
+    which will surface the original (buggy) behavior and let n8n raise the
+    clearer type-validation error — better than a silent truncation.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        try:
+            return float(s)
+        except ValueError:
+            pass
+    return str(value)
 
 
 def _translate_if_params(spec_params: dict) -> dict:
@@ -167,10 +197,21 @@ def _translate_if_params(spec_params: dict) -> dict:
             else:
                 op_type = 'number'
 
+            # n8n IF v2 enforces that rightValue matches operator.type. A
+            # numeric comparison with a stringy rightValue ("0") trips
+            # "Wrong type: '0' is a string but was expecting a number" and
+            # the workflow aborts.
+            if op_type == 'number' and value != '':
+                right_value: object = _coerce_number(value)
+            elif value == '':
+                right_value = ''
+            else:
+                right_value = str(value)
+
             n8n_cond_list.append({
                 'id': f'cond_{i}',
                 'leftValue': field_expr,
-                'rightValue': str(value) if value != '' else '',
+                'rightValue': right_value,
                 'operator': {
                     'type': op_type,
                     'operation': n8n_op,

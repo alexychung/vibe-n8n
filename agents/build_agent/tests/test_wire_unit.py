@@ -89,12 +89,14 @@ class TestTranslateIfParams(unittest.TestCase):
         self.assertEqual(c0['operator']['type'], 'string')
         self.assertEqual(c0['operator']['operation'], 'notEmpty')
 
-        # Second condition: number operation
+        # Second condition: number operation. rightValue must be a native
+        # number so n8n's strict type validator (IF v2) doesn't reject it.
         c1 = conds['conditions'][1]
         self.assertEqual(c1['leftValue'], '={{ $json.value }}')
         self.assertEqual(c1['operator']['type'], 'number')
         self.assertEqual(c1['operator']['operation'], 'gte')
-        self.assertEqual(c1['rightValue'], '0')
+        self.assertEqual(c1['rightValue'], 0)
+        self.assertIsInstance(c1['rightValue'], int)
 
     def test_operation_mapping(self):
         for spec_op, n8n_op in [
@@ -200,7 +202,8 @@ class TestTranslateIfParams(unittest.TestCase):
         cond = result['conditions']['conditions'][0]
         self.assertEqual(cond['operator']['type'], 'number')
         self.assertEqual(cond['operator']['operation'], 'equals')
-        self.assertEqual(cond['rightValue'], '42')
+        self.assertEqual(cond['rightValue'], 42)
+        self.assertIsInstance(cond['rightValue'], int)
 
     def test_already_translated_boolean_gets_fixed(self):
         """When LLM outputs native n8n format with boolean equals, fix it."""
@@ -285,8 +288,12 @@ class TestTranslateIfParams(unittest.TestCase):
             '={{ String($json.foo) }}',
         )
 
-    def test_already_translated_non_boolean_unchanged(self):
-        """Native n8n format with numeric equals should stay unchanged."""
+    def test_already_translated_number_rightvalue_coerced(self):
+        """Native n8n format with a stringy numeric rightValue must be coerced.
+
+        n8n IF v2 rejects `"42"` (string) when operator.type == 'number';
+        this path hits when an LLM emits already-translated conditions.
+        """
         params = {
             'conditions': {
                 'options': {'caseSensitive': True, 'leftValue': ''},
@@ -305,7 +312,8 @@ class TestTranslateIfParams(unittest.TestCase):
         cond = result['conditions']['conditions'][0]
         self.assertEqual(cond['operator']['type'], 'number')
         self.assertEqual(cond['operator']['operation'], 'gte')
-        self.assertEqual(cond['rightValue'], '42')
+        self.assertEqual(cond['rightValue'], 42)
+        self.assertIsInstance(cond['rightValue'], int)
 
     def test_string_equals_stays_as_string(self):
         """Equals with a non-boolean string value should use string type."""
