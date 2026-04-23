@@ -9,10 +9,12 @@ Usage:
     python -m build_agent list                        # List deployed workflows
     python -m build_agent export <wf-id> <spec.json>  # Re-export a deployed workflow
 """
+import datetime
 import io
 import json
 import os
 import sys
+import uuid
 
 # Fix Windows console encoding — topology uses box-drawing glyphs (●│├) and
 # generated auth messages can include Unicode from workflow names. Default
@@ -57,6 +59,26 @@ def load_env():
         d = os.path.dirname(d)
 
 
+def _project_root():
+    d = os.path.dirname(__file__)
+    for _ in range(5):
+        if os.path.exists(os.path.join(d, '.env')) or os.path.exists(os.path.join(d, 'CLAUDE.md')):
+            return d
+        d = os.path.dirname(d)
+    return os.getcwd()
+
+
+def log_event(event: dict):
+    """Append one JSONL line to build-logs/build-inputs.jsonl. Never raises."""
+    try:
+        log_path = os.path.join(_project_root(), 'build-logs', 'build-inputs.jsonl')
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(event, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
 def load_spec(spec_path: str):
     """Load and parse a spec file."""
     try:
@@ -76,8 +98,33 @@ def cmd_build(
     export_dir: str = 'workflows/live',
 ):
     """Full build pipeline: SCAFFOLD → WIRE → TEST → AUDIT → HARDEN → CODIFY → DEPLOY → EXPORT."""
+    session_id = uuid.uuid4().hex[:12]
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     spec = load_spec(spec_path)
     status = BuildStatus(spec.workflow_name)
+
+    log_event({
+        'ts': now,
+        'session_id': session_id,
+        'kind': 'input',
+        'spec_path': spec_path,
+        'workflow_name': spec.workflow_name,
+        'step_count': len(spec.steps),
+        'gate_count': len(spec.gates),
+        'test_case_count': len(spec.test_cases),
+        'dry_run': dry_run,
+        'export': export,
+    })
+
+    def _outcome(status_str: str, **extra):
+        log_event({
+            'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'session_id': session_id,
+            'kind': 'outcome',
+            'status': status_str,
+            'workflow_name': spec.workflow_name,
+            **extra,
+        })
 
     if dry_run:
         print(f'Spec: {spec.workflow_name}')
@@ -85,10 +132,12 @@ def cmd_build(
         print()
         print(_render_topology(spec))
         print('\nDry run complete — no workflow created.')
+        _outcome('dry_run')
         return 0
 
     if not os.environ.get('N8N_API_KEY'):
         print('Error: N8N_API_KEY not set. Add it to .env or set the environment variable.')
+        _outcome('missing_api_key')
         return 1
 
     client = N8nClient()
@@ -120,6 +169,7 @@ def cmd_build(
                 print(status.render())
                 print()
                 print(render_results(results))
+                _outcome('test_failed', workflow_id=workflow_id, tests_passed=passed, tests_total=total)
                 return 1
         else:
             status.done('TEST', f'skipped (no webhook trigger — verify manually in n8n)')
@@ -151,6 +201,7 @@ def cmd_build(
                 print(status.render())
                 print()
                 print(render_findings(final_findings))
+                _outcome('harden_failed', workflow_id=workflow_id, critical_remaining=remaining_critical)
                 return 1
             else:
                 msg = f'Fixed {fixed}/{warning} warnings'
@@ -215,9 +266,22 @@ def cmd_build(
         print()
 
         print(f'Workflow deployed: {workflow_id}')
+        _outcome(
+            'success',
+            workflow_id=workflow_id,
+            smoke_test_passed=bool(deploy_result.get('smoke_test_passed')),
+            unfixed_warnings=len(unfixed_warnings),
+            generated_auth_count=len(generated_auth),
+        )
         return 0
 
     except Exception as e:
+        _outcome(
+            'error',
+            workflow_id=workflow_id,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
         if workflow_id:
             print(f'\nBuild failed at workflow {workflow_id}.')
             try:
