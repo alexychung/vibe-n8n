@@ -258,6 +258,61 @@ code {
   font: 12px ui-monospace, Menlo, Consolas, monospace;
 }
 
+/* Auth pages */
+.auth-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+.auth-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.75rem 2rem;
+  width: 100%;
+  max-width: 380px;
+}
+.auth-card h1 { margin: 0; font-size: 1.1rem; color: var(--accent); letter-spacing: 0.02em; }
+.auth-card h2 { margin: 0.25rem 0 1.25rem; font-size: 1.4rem; }
+.auth-card form { display: flex; flex-direction: column; gap: 0.4rem; }
+.auth-card label { margin: 0.5rem 0 0; }
+.auth-card input { background: var(--bg); }
+.auth-card button { margin-top: 1rem; padding: 0.6rem; }
+.auth-card a { color: var(--accent); text-decoration: none; }
+.auth-card a:hover { text-decoration: underline; }
+.auth-card .hint { text-align: center; margin: 1rem 0 0; }
+.auth-error {
+  margin: 0.75rem 0 0;
+  padding: 0.5rem 0.75rem;
+  background: rgba(248, 113, 113, 0.08);
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  color: #f1c2c2;
+  font-size: 0.85rem;
+  min-height: 0;
+}
+.auth-error:empty { display: none; }
+
+/* Header user identity */
+.user-id {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+.user-id button {
+  padding: 0.2rem 0.55rem;
+  font-size: 0.78rem;
+  background: var(--panel-2);
+}
+.user-id button:hover { color: var(--text); }
+
 /* Plan mode toggle */
 .mode-row {
   display: flex;

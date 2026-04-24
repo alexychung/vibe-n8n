@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign up — vibe-n8n</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="auth-body">
+  <main class="auth-card">
+    <h1>vibe-n8n</h1>
+    <h2>Create account</h2>
+    <form id="signup-form">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email" required />
+
+      <label for="password">Password (min 8 chars)</label>
+      <input id="password" name="password" type="password" autocomplete="new-password" required minlength="8" />
+
+      <button type="submit" class="primary">Create account</button>
+      <p id="error" class="auth-error"></p>
+      <p class="hint">Have an account? <a href="/login">Sign in</a></p>
+    </form>
+  </main>
+  <script>
+    const form = document.getElementById('signup-form');
+    const errEl = document.getElementById('error');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errEl.textContent = '';
+      const btn = form.querySelector('button');
+      btn.disabled = true;
+      btn.textContent = 'Creating…';
+      try {
+        const r = await fetch('/api/auth/signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({
+            email: form.email.value.trim(),
+            password: form.password.value,
+          }),
+        });
+        if (!r.ok) {
+          const data = await r.json().catch(() => ({}));
+          errEl.textContent = data.detail || 'Sign-up failed.';
+          return;
+        }
+        window.location.href = '/';
+      } catch (e) {
+        errEl.textContent = `Request failed: ${e.message}`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Create account';
+      }
+    });
+  </script>
+</body>
+</html>

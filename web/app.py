@@ -28,11 +28,13 @@ import uuid
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
+
+from web import auth, db
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 STATIC_DIR = pathlib.Path(__file__).resolve().parent / 'static'
@@ -68,24 +70,42 @@ OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 WEB_AUTH_PASSWORD = os.environ.get('WEB_AUTH_PASSWORD', '')
 WEB_AUTH_USER = os.environ.get('WEB_AUTH_USER', 'admin')
 
+SECURE_COOKIES = os.environ.get('COOKIE_SECURE', '').lower() in ('1', 'true', 'yes')
+
 app = FastAPI(title='vibe-n8n')
 
 
+@app.on_event('startup')
+async def _startup():
+    await db.init_pool()
+
+
+@app.on_event('shutdown')
+async def _shutdown():
+    await db.close_pool()
+
+
 class BasicAuthMiddleware(BaseHTTPMiddleware):
-    """HTTP Basic Auth gate. Leaves /api/health open for Railway healthchecks."""
+    """HTTP Basic Auth gate. Used in single-user mode (no DATABASE_URL).
+
+    Skipped entirely when multi-user mode is active — SessionMiddleware
+    handles auth instead.
+    """
 
     OPEN_PATHS = {'/api/health'}
 
     async def dispatch(self, request: Request, call_next):
+        if db.is_enabled():
+            return await call_next(request)
         if not WEB_AUTH_PASSWORD:
             return await call_next(request)
         if request.url.path in self.OPEN_PATHS:
             return await call_next(request)
 
-        auth = request.headers.get('authorization', '')
-        if auth.startswith('Basic '):
+        auth_header = request.headers.get('authorization', '')
+        if auth_header.startswith('Basic '):
             try:
-                decoded = base64.b64decode(auth[6:]).decode('utf-8', errors='replace')
+                decoded = base64.b64decode(auth_header[6:]).decode('utf-8', errors='replace')
                 user, _, pw = decoded.partition(':')
                 if secrets.compare_digest(user, WEB_AUTH_USER) and secrets.compare_digest(pw, WEB_AUTH_PASSWORD):
                     return await call_next(request)
@@ -99,6 +119,8 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
         )
 
 
+# Both middlewares are mounted; each is a no-op in the wrong mode.
+app.add_middleware(auth.SessionMiddleware, secure_cookies=SECURE_COOKIES)
 app.add_middleware(BasicAuthMiddleware)
 
 
@@ -180,7 +202,72 @@ def config():
         'n8n_public_url': N8N_PUBLIC_URL,
         'has_openai': bool(OPENAI_API_KEY),
         'has_anthropic': bool(os.environ.get('ANTHROPIC_API_KEY')),
+        'multi_user': db.is_enabled(),
     }
+
+
+# ---------- auth endpoints (multi-user mode) ----------
+
+EMAIL_RE = __import__('re').compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+
+
+class AuthCredsRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=200)
+    password: str = Field(..., min_length=8, max_length=200)
+
+
+def _require_multi_user():
+    if not db.is_enabled():
+        raise HTTPException(503, 'multi-user mode disabled (DATABASE_URL unset)')
+
+
+@app.post('/api/auth/signup')
+async def signup(req: AuthCredsRequest, request: Request):
+    _require_multi_user()
+    email = req.email.strip().lower()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, 'invalid email')
+    user = await auth.create_user(email, req.password)
+    token = await auth.create_session(user['id'], request.headers.get('user-agent', ''))
+    response = JSONResponse({'user': {'id': user['id'], 'email': user['email']}})
+    auth.set_session_cookie(response, token, secure=SECURE_COOKIES)
+    return response
+
+
+@app.post('/api/auth/login')
+async def login(req: AuthCredsRequest, request: Request):
+    _require_multi_user()
+    user = await auth.authenticate(req.email, req.password)
+    if user is None:
+        raise HTTPException(401, 'invalid email or password')
+    token = await auth.create_session(user['id'], request.headers.get('user-agent', ''))
+    response = JSONResponse({'user': {'id': user['id'], 'email': user['email']}})
+    auth.set_session_cookie(response, token, secure=SECURE_COOKIES)
+    return response
+
+
+@app.post('/api/auth/logout')
+async def logout(request: Request):
+    token = request.cookies.get(auth.SESSION_COOKIE)
+    if token:
+        await auth.delete_session(token)
+    response = JSONResponse({'ok': True})
+    auth.clear_session_cookie(response, secure=SECURE_COOKIES)
+    return response
+
+
+@app.get('/api/me')
+async def me(request: Request):
+    """Returns {user: null} when not signed in (no 401)."""
+    if not db.is_enabled():
+        return {'user': None, 'multi_user': False}
+    token = request.cookies.get(auth.SESSION_COOKIE)
+    if not token:
+        return {'user': None, 'multi_user': True}
+    sess = await auth.lookup_session(token)
+    if sess is None:
+        return {'user': None, 'multi_user': True}
+    return {'user': {'id': sess['user_id'], 'email': sess['email']}, 'multi_user': True}
 
 
 @app.get('/api/workflows')
@@ -774,3 +861,19 @@ def index():
     if not index_path.exists():
         return JSONResponse({'error': 'index.html not found'}, status_code=500)
     return FileResponse(str(index_path))
+
+
+@app.get('/login')
+def login_page():
+    p = STATIC_DIR / 'login.html'
+    if not p.exists():
+        return JSONResponse({'error': 'login.html not found'}, status_code=500)
+    return FileResponse(str(p))
+
+
+@app.get('/signup')
+def signup_page():
+    p = STATIC_DIR / 'signup.html'
+    if not p.exists():
+        return JSONResponse({'error': 'signup.html not found'}, status_code=500)
+    return FileResponse(str(p))

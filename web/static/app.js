@@ -619,6 +619,28 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// ---------- auth bootstrap ----------
+fetch('/api/me', { credentials: 'same-origin' })
+  .then(r => r.json())
+  .then(data => {
+    if (data.multi_user && !data.user) {
+      window.location.href = '/login';
+      return;
+    }
+    if (data.user) {
+      $('#user-id').classList.remove('hidden');
+      $('#user-email').textContent = data.user.email;
+    }
+  })
+  .catch(() => {});
+
+$('#logout').addEventListener('click', async () => {
+  try {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+  } catch (e) {}
+  window.location.href = '/login';
+});
+
 // preload config
 fetch('/api/config').then(r => r.json()).then(cfg => {
   hasOpenAI = !!cfg.has_openai;
