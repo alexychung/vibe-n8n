@@ -9,12 +9,65 @@ Run:
 import os
 import pytest
 import asyncio
+import json
 import uuid
 
 pytest.importorskip('asyncpg')
 pytest.importorskip('argon2')
+import asyncpg
 
 TEST_DSN = os.environ.get('TEST_DATABASE_URL', '')
+
+
+def _run_async(coro):
+    """Run a coroutine in a fresh event loop.
+
+    Used by tests that need to do DB work outside the TestClient's loop.
+    Each call connects fresh — never touches the asyncpg pool, which is
+    pinned to whatever loop TestClient created it on.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+async def _db_lookup_user_id(email: str) -> str:
+    conn = await asyncpg.connect(TEST_DSN, statement_cache_size=0)
+    try:
+        row = await conn.fetchrow(
+            'SELECT id FROM users WHERE email = $1', email.lower()
+        )
+        return str(row['id'])
+    finally:
+        await conn.close()
+
+
+async def _db_insert_spec(user_id: str, spec: dict) -> str:
+    conn = await asyncpg.connect(TEST_DSN, statement_cache_size=0)
+    try:
+        row = await conn.fetchrow(
+            '''INSERT INTO specs (user_id, workflow_name, spec_json)
+               VALUES ($1, $2, $3::jsonb) RETURNING id''',
+            user_id, spec.get('workflow_name'), json.dumps(spec),
+        )
+        return str(row['id'])
+    finally:
+        await conn.close()
+
+
+async def _db_claim_workflow(user_id: str, n8n_workflow_id: str):
+    conn = await asyncpg.connect(TEST_DSN, statement_cache_size=0)
+    try:
+        await conn.execute(
+            '''INSERT INTO workflow_owners (n8n_workflow_id, user_id)
+               VALUES ($1, $2)
+               ON CONFLICT (n8n_workflow_id) DO NOTHING''',
+            n8n_workflow_id, user_id,
+        )
+    finally:
+        await conn.close()
 
 
 @pytest.fixture(scope='module')
@@ -99,86 +152,77 @@ def test_unauth_api_returns_401(client):
     assert r.status_code == 401
 
 
+def _signup_get_cookie(client, email: str) -> str:
+    """Sign up and return the captured session cookie. Clears the client's
+    persistent cookie jar after so the next signup doesn't auth as this user.
+
+    Don't call /api/auth/logout — that *deletes* the session row, which would
+    invalidate the cookie we want to reuse.
+    """
+    r = client.post('/api/auth/signup', json={'email': email, 'password': 'testpass123'})
+    assert r.status_code == 200, r.text
+    cookie = r.cookies.get('vibe_session')
+    assert cookie
+    client.cookies.clear()
+    return cookie
+
+
 def test_two_user_spec_isolation(client):
     """User A's specs are invisible to user B."""
-    from fastapi.testclient import TestClient
-    from web.app import app
-
     email_a = f'a_{uuid.uuid4().hex[:8]}@test.local'
     email_b = f'b_{uuid.uuid4().hex[:8]}@test.local'
 
-    # Use independent client objects so cookies don't leak
-    with TestClient(app) as ca, TestClient(app) as cb:
-        ca.post('/api/auth/signup', json={'email': email_a, 'password': 'testpass123'})
-        cb.post('/api/auth/signup', json={'email': email_b, 'password': 'testpass123'})
+    cookie_a = _signup_get_cookie(client, email_a)
+    cookie_b = _signup_get_cookie(client, email_b)
 
-        # User A inserts a spec via the storage layer (avoids running the full
-        # PM Agent, which costs API credits in tests).
-        # We POST to /api/plan only if you want a true e2e test; here we
-        # exercise the access-control path more cheaply via direct DB write.
-        from web import db, storage
-        loop = asyncio.new_event_loop()
-        try:
-            user_a = loop.run_until_complete(_lookup_user(email_a))
-            spec_id = loop.run_until_complete(
-                storage.save_spec(user_a, {'workflow_name': 'A-only'})
-            )
-        finally:
-            loop.close()
+    # User A inserts a spec via direct SQL (avoids running the PM Agent,
+    # which costs API credits, and avoids the asyncpg pool — that pool is
+    # pinned to TestClient's event loop).
+    user_a = _run_async(_db_lookup_user_id(email_a))
+    spec_id = _run_async(_db_insert_spec(user_a, {'workflow_name': 'A-only'}))
 
-        # User A sees it
-        ra = ca.get('/api/specs')
-        assert ra.status_code == 200
-        names = [s['name'] for s in ra.json()]
-        assert 'A-only' in names
+    # User A sees it
+    client.cookies.clear()
+    client.cookies.set('vibe_session', cookie_a)
+    ra = client.get('/api/specs')
+    assert ra.status_code == 200
+    assert 'A-only' in [s['name'] for s in ra.json()]
 
-        # User B does NOT
-        rb = cb.get('/api/specs')
-        assert rb.status_code == 200
-        names_b = [s['name'] for s in rb.json()]
-        assert 'A-only' not in names_b
+    # User B does NOT
+    client.cookies.clear()
+    client.cookies.set('vibe_session', cookie_b)
+    rb = client.get('/api/specs')
+    assert rb.status_code == 200
+    assert 'A-only' not in [s['name'] for s in rb.json()]
 
-        # User B can't fetch the spec content by id either
-        rb2 = cb.get(f'/api/specs/content?id={spec_id}')
-        assert rb2.status_code == 404
-
-
-async def _lookup_user(email: str) -> str:
-    from web import db
-    pool = db.get_pool()
-    row = await pool.fetchrow('SELECT id FROM users WHERE email = $1', email.lower())
-    return str(row['id'])
+    # User B can't fetch the spec content by id either
+    rb2 = client.get(f'/api/specs/content?id={spec_id}')
+    assert rb2.status_code == 404
 
 
 def test_workflow_ownership_filters_listing(client):
     """User A's claimed n8n workflow ID is hidden from user B's /api/workflows."""
-    from fastapi.testclient import TestClient
-    from web.app import app
-    from web import storage
-
     email_a = f'wfa_{uuid.uuid4().hex[:8]}@test.local'
     email_b = f'wfb_{uuid.uuid4().hex[:8]}@test.local'
     fake_wf = f'fake_wf_{uuid.uuid4().hex[:6]}'
 
-    with TestClient(app) as ca, TestClient(app) as cb:
-        ca.post('/api/auth/signup', json={'email': email_a, 'password': 'testpass123'})
-        cb.post('/api/auth/signup', json={'email': email_b, 'password': 'testpass123'})
+    _signup_get_cookie(client, email_a)
+    cookie_b = _signup_get_cookie(client, email_b)
 
-        loop = asyncio.new_event_loop()
-        try:
-            user_a = loop.run_until_complete(_lookup_user(email_a))
-            loop.run_until_complete(storage.claim_workflow(user_a, fake_wf))
-        finally:
-            loop.close()
+    user_a = _run_async(_db_lookup_user_id(email_a))
+    _run_async(_db_claim_workflow(user_a, fake_wf))
 
-        # /api/workflows hits the live n8n; even if the ID isn't there, the
-        # filter should not raise and B should see no entry with this ID.
-        rb = cb.get('/api/workflows')
-        assert rb.status_code in (200, 502)  # 502 if n8n unreachable in CI
-        if rb.status_code == 200:
-            ids = [w['id'] for w in rb.json()]
-            assert fake_wf not in ids
+    client.cookies.clear()
+    client.cookies.set('vibe_session', cookie_b)
 
-        # Direct ownership check: B can't activate A's workflow
-        r = cb.post(f'/api/workflows/{fake_wf}/activate')
-        assert r.status_code == 404
+    # /api/workflows hits the live n8n; even if the ID isn't there, the
+    # filter should not raise and B should see no entry with this ID.
+    rb = client.get('/api/workflows')
+    assert rb.status_code in (200, 502)  # 502 if n8n unreachable in CI
+    if rb.status_code == 200:
+        ids = [w['id'] for w in rb.json()]
+        assert fake_wf not in ids
+
+    # Direct ownership check: B can't activate A's workflow
+    r = client.post(f'/api/workflows/{fake_wf}/activate')
+    assert r.status_code == 404
