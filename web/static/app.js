@@ -256,9 +256,12 @@ async function runPlan(payload) {
         log.textContent += `\n[exit ${data.exit_code}]\n`;
         if (data.spec) {
           $('#plan-result').classList.remove('hidden');
-          $('#plan-spec-path').textContent = data.spec_path || '';
+          // Display either spec_path (single-user) or spec_id (multi-user)
+          $('#plan-spec-path').textContent = data.spec_path || data.spec_id || '';
           $('#plan-spec').textContent = JSON.stringify(data.spec, null, 2);
-          $('#build-spec').dataset.specPath = data.spec_path || '';
+          const btn = $('#build-spec');
+          btn.dataset.specPath = data.spec_path || '';
+          btn.dataset.specId = data.spec_id || '';
         }
       } else if (evt === 'error') {
         log.textContent += `\nERROR: ${data.message}\n`;
@@ -283,20 +286,21 @@ $('#copy-spec').addEventListener('click', async () => {
 
 // ---------- Build this (SSE) ----------
 $('#build-spec').addEventListener('click', async () => {
-  const specPath = $('#build-spec').dataset.specPath;
-  if (!specPath) { alert('No spec available.'); return; }
+  const btn = $('#build-spec');
+  const specPath = btn.dataset.specPath;
+  const specId = btn.dataset.specId;
+  if (!specPath && !specId) { alert('No spec available.'); return; }
   const log = $('#build-log');
   log.textContent = '';
   $('#build-box').classList.remove('hidden');
   $('#build-done').classList.add('hidden');
-  const btn = $('#build-spec');
   btn.disabled = true;
   btn.textContent = 'Building…';
   try {
     const r = await fetch('/api/build', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ spec_path: specPath }),
+      body: JSON.stringify(specId ? { spec_id: specId } : { spec_path: specPath }),
     });
     if (!r.ok) { log.textContent = `Error: ${await r.text()}`; return; }
     await consumeSSE(r.body, (evt, data) => {
@@ -521,12 +525,13 @@ async function loadSpecs() {
     if (!specs.length) { ul.innerHTML = '<li class="hint">No specs yet.</li>'; return; }
     for (const s of specs) {
       const li = document.createElement('li');
-      li.dataset.path = s.path;
+      li.dataset.key = s.id || s.path;
       const when = s.mtime ? new Date(s.mtime * 1000).toLocaleString() : '';
+      const kind = s.kind || 'spec';
       li.innerHTML = `
         <div>
           <span class="name" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>
-          <span class="badge ${s.kind === 'live' ? 'inactive' : 'active'}">${s.kind}</span>
+          <span class="badge ${kind === 'live' ? 'inactive' : 'active'}">${kind}</span>
         </div>
         <div class="hint small">${escapeHtml(when)}</div>
       `;
@@ -545,17 +550,19 @@ async function selectSpec(s, li) {
   $('#spec-empty').classList.add('hidden');
   $('#spec-view').classList.remove('hidden');
   $('#spec-name').textContent = s.name;
-  $('#spec-path').textContent = s.path;
+  $('#spec-path').textContent = s.id || s.path || '';
+  const kind = s.kind || 'spec';
   const kindBadge = $('#spec-kind');
-  kindBadge.textContent = s.kind;
-  kindBadge.className = `badge ${s.kind === 'live' ? 'inactive' : 'active'}`;
+  kindBadge.textContent = kind;
+  kindBadge.className = `badge ${kind === 'live' ? 'inactive' : 'active'}`;
   $('#spec-content').textContent = 'Loading…';
   $('#spec-build-box').classList.add('hidden');
-  $('#spec-build').disabled = s.kind === 'live';
-  $('#spec-build').title = s.kind === 'live' ? 'Live exports are not rebuildable' : '';
+  $('#spec-build').disabled = kind === 'live';
+  $('#spec-build').title = kind === 'live' ? 'Live exports are not rebuildable' : '';
 
   try {
-    const r = await fetch(`/api/specs/content?path=${encodeURIComponent(s.path)}`);
+    const qs = s.id ? `id=${encodeURIComponent(s.id)}` : `path=${encodeURIComponent(s.path)}`;
+    const r = await fetch(`/api/specs/content?${qs}`);
     if (!r.ok) { $('#spec-content').textContent = `Error: ${await r.text()}`; return; }
     const data = await r.json();
     $('#spec-content').textContent = JSON.stringify(data, null, 2);
@@ -576,7 +583,7 @@ $('#spec-copy').addEventListener('click', async () => {
 });
 
 $('#spec-build').addEventListener('click', async () => {
-  if (!selectedSpec || selectedSpec.kind === 'live') return;
+  if (!selectedSpec || (selectedSpec.kind || 'spec') === 'live') return;
   const log = $('#spec-build-log');
   log.textContent = '';
   $('#spec-build-box').classList.remove('hidden');
@@ -588,7 +595,7 @@ $('#spec-build').addEventListener('click', async () => {
     const r = await fetch('/api/build', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ spec_path: selectedSpec.path }),
+      body: JSON.stringify(selectedSpec.id ? { spec_id: selectedSpec.id } : { spec_path: selectedSpec.path }),
     });
     if (!r.ok) { log.textContent = `Error: ${await r.text()}`; return; }
     await consumeSSE(r.body, (evt, data) => {

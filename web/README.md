@@ -24,8 +24,11 @@ Required env vars (read from `.env` in repo root if not already set):
 | `N8N_API_KEY`       | n8n API key                                     |
 | `ANTHROPIC_API_KEY` | PM Agent LLM                                    |
 | `OPENAI_API_KEY`    | Whisper STT (voice input). Optional.            |
-| `WEB_AUTH_PASSWORD` | Shared secret for HTTP Basic Auth. If unset, the app is open (local dev only). |
+| `WEB_AUTH_PASSWORD` | Shared secret for HTTP Basic Auth. Single-user mode only. |
 | `WEB_AUTH_USER`     | Username for Basic Auth. Defaults to `admin`.   |
+| `DATABASE_URL`      | Postgres connection string (Neon). Setting this turns on **multi-user mode** — signup/login at `/login`, per-user spec/workflow isolation. Migrations run on startup. |
+| `COOKIE_SECURE`     | `1`/`true` to set `Secure` flag on session cookies. Required for HTTPS deploys. Defaults off so localhost dev works. |
+| `TEST_DATABASE_URL` | Used only by `web/tests/test_multi_user.py`. Should be a Neon branch — tests don't clean up. |
 
 ## Deploy to Railway
 

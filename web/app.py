@@ -34,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from web import auth, db
+from web import auth, db, storage
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 STATIC_DIR = pathlib.Path(__file__).resolve().parent / 'static'
@@ -270,10 +270,21 @@ async def me(request: Request):
     return {'user': {'id': sess['user_id'], 'email': sess['email']}, 'multi_user': True}
 
 
+async def _user_or_none(request: Request) -> Optional[str]:
+    """Return user_id if multi-user mode is on (set by SessionMiddleware), else None."""
+    if not db.is_enabled():
+        return None
+    return getattr(request.state, 'user_id', None)
+
+
 @app.get('/api/workflows')
-async def list_workflows():
+async def list_workflows(request: Request):
     data = await n8n_get('/api/v1/workflows')
     workflows = data.get('data', [])
+    user_id = await _user_or_none(request)
+    if user_id is not None:
+        owned = await storage.owned_workflow_ids(user_id)
+        workflows = [w for w in workflows if w.get('id') in owned]
     out = []
     for w in workflows:
         webhooks = extract_webhook_infos(w)
@@ -289,8 +300,21 @@ async def list_workflows():
     return out
 
 
+async def _check_owner(request: Request, workflow_id: str):
+    """Raise 404 in multi-user mode if the user doesn't own this workflow.
+
+    404 (not 403) so we don't leak existence of other users' workflows.
+    """
+    user_id = await _user_or_none(request)
+    if user_id is None:
+        return
+    if not await storage.is_owner(user_id, workflow_id):
+        raise HTTPException(404, 'workflow not found')
+
+
 @app.get('/api/workflows/{workflow_id}')
-async def get_workflow(workflow_id: str):
+async def get_workflow(workflow_id: str, request: Request):
+    await _check_owner(request, workflow_id)
     w = await n8n_get(f'/api/v1/workflows/{workflow_id}')
     webhooks = extract_webhook_infos(w)
     return {
@@ -313,8 +337,9 @@ class RunRequest(BaseModel):
 
 
 @app.post('/api/workflows/{workflow_id}/run')
-async def run_workflow(workflow_id: str, req: RunRequest):
+async def run_workflow(workflow_id: str, req: RunRequest, request: Request):
     """Fire a webhook-triggered workflow. Only works for webhook-triggered workflows."""
+    await _check_owner(request, workflow_id)
     w = await n8n_get(f'/api/v1/workflows/{workflow_id}')
     webhooks = extract_webhook_infos(w)
     if not webhooks:
@@ -385,7 +410,8 @@ async def n8n_request(method: str, path: str, body=None) -> Optional[dict]:
 
 
 @app.post('/api/workflows/{workflow_id}/activate')
-async def activate_workflow(workflow_id: str):
+async def activate_workflow(workflow_id: str, request: Request):
+    await _check_owner(request, workflow_id)
     await n8n_request('POST', f'/api/v1/workflows/{workflow_id}/activate')
     log_request({
         'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -395,7 +421,8 @@ async def activate_workflow(workflow_id: str):
 
 
 @app.post('/api/workflows/{workflow_id}/deactivate')
-async def deactivate_workflow(workflow_id: str):
+async def deactivate_workflow(workflow_id: str, request: Request):
+    await _check_owner(request, workflow_id)
     await n8n_request('POST', f'/api/v1/workflows/{workflow_id}/deactivate')
     log_request({
         'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -405,8 +432,12 @@ async def deactivate_workflow(workflow_id: str):
 
 
 @app.delete('/api/workflows/{workflow_id}')
-async def delete_workflow(workflow_id: str):
+async def delete_workflow(workflow_id: str, request: Request):
+    await _check_owner(request, workflow_id)
     await n8n_request('DELETE', f'/api/v1/workflows/{workflow_id}')
+    user_id = await _user_or_none(request)
+    if user_id is not None:
+        await storage.release_workflow(user_id, workflow_id)
     log_request({
         'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'kind': 'delete', 'workflow_id': workflow_id,
@@ -415,7 +446,8 @@ async def delete_workflow(workflow_id: str):
 
 
 @app.get('/api/workflows/{workflow_id}/executions')
-async def list_executions(workflow_id: str, limit: int = 20, include_data: bool = False):
+async def list_executions(workflow_id: str, request: Request, limit: int = 20, include_data: bool = False):
+    await _check_owner(request, workflow_id)
     limit = max(1, min(limit, 100))
     qs = f'?workflowId={workflow_id}&limit={limit}'
     if include_data:
@@ -463,8 +495,16 @@ SPEC_DIRS = [
 
 
 @app.get('/api/specs')
-async def list_specs():
-    """List JSON specs (rebuildable) and live workflow exports (read-only)."""
+async def list_specs(request: Request):
+    """List JSON specs (rebuildable) and live workflow exports (read-only).
+
+    In multi-user mode this returns DB-backed specs owned by the user
+    (kind='spec') only — filesystem scan is single-user only.
+    """
+    user_id = await _user_or_none(request)
+    if user_id is not None:
+        return await storage.list_specs(user_id)
+
     out = []
     for rel_dir, pattern, kind in SPEC_DIRS:
         root = PROJECT_ROOT / rel_dir
@@ -506,7 +546,19 @@ async def list_specs():
 
 
 @app.get('/api/specs/content')
-async def spec_content(path: str):
+async def spec_content(request: Request, path: Optional[str] = None, id: Optional[str] = None):
+    """Return spec JSON. Multi-user mode uses ?id=<uuid>; single-user uses ?path=..."""
+    user_id = await _user_or_none(request)
+    if user_id is not None:
+        if not id:
+            raise HTTPException(400, 'id is required in multi-user mode')
+        record = await storage.get_spec(id, user_id)
+        if record is None:
+            raise HTTPException(404, 'spec not found')
+        return record['spec']
+    # single-user fallback
+    if not path:
+        raise HTTPException(400, 'path is required in single-user mode')
     sp = _safe_project_path(path)
     if not sp.exists() or not sp.is_file():
         raise HTTPException(404, 'spec not found')
@@ -588,15 +640,21 @@ class PlanRequest(BaseModel):
 
 
 @app.post('/api/plan')
-async def plan(req: PlanRequest):
+async def plan(req: PlanRequest, request: Request):
     """Run PM Agent on the provided brief OR pre-computed requirements JSON.
 
     Streams stdout lines as SSE events. Final `done` event carries the spec.
+
+    Multi-user mode: persists the spec to the `specs` table and returns a
+    `spec_id`. Single-user mode: keeps writing to workflows/test-data and
+    returns a `spec_path`.
     """
+    user_id = await _user_or_none(request)
     session_id = uuid.uuid4().hex[:12]
     spec_path = PROJECT_ROOT / 'workflows' / 'test-data' / f'web-{session_id}-spec.json'
     spec_path.parent.mkdir(parents=True, exist_ok=True)
 
+    brief_text: Optional[str] = None
     if req.requirements_path:
         rp = _safe_project_path(req.requirements_path)
         if not rp.exists():
@@ -608,10 +666,10 @@ async def plan(req: PlanRequest):
         ]
         input_kind = 'requirements'
     elif req.brief and req.brief.strip():
-        brief = req.brief.strip()
+        brief_text = req.brief.strip()
         brief_path = PROJECT_ROOT / 'build-logs' / f'web-brief-{session_id}.md'
         brief_path.parent.mkdir(parents=True, exist_ok=True)
-        brief_path.write_text(brief, encoding='utf-8')
+        brief_path.write_text(brief_text, encoding='utf-8')
         cmd = [
             sys.executable, '-m', 'agents.pm_agent', 'plan',
             '--from-brief', str(brief_path),
@@ -626,6 +684,7 @@ async def plan(req: PlanRequest):
         'kind': 'plan',
         'session_id': session_id,
         'input_kind': input_kind,
+        'user_id': user_id,
     })
 
     async def event_stream():
@@ -643,11 +702,24 @@ async def plan(req: PlanRequest):
             except Exception as e:
                 yield _sse('error', {'message': f'Failed to read spec: {e}'})
                 return
-            yield _sse('done', {
-                'exit_code': rc,
-                'spec_path': str(spec_path.relative_to(PROJECT_ROOT)).replace('\\', '/'),
-                'spec': spec,
-            })
+
+            done_payload: dict = {'exit_code': rc, 'spec': spec}
+            if user_id is not None:
+                try:
+                    spec_id = await storage.save_spec(user_id, spec, brief_text=brief_text)
+                    done_payload['spec_id'] = spec_id
+                except Exception as e:
+                    yield _sse('error', {'message': f'Failed to save spec: {e}'})
+                    return
+                # Drop the temp file — DB is authoritative now.
+                try:
+                    spec_path.unlink()
+                except OSError:
+                    pass
+            else:
+                done_payload['spec_path'] = str(spec_path.relative_to(PROJECT_ROOT)).replace('\\', '/')
+
+            yield _sse('done', done_payload)
         else:
             yield _sse('done', {'exit_code': rc, 'spec_path': None})
 
@@ -661,24 +733,74 @@ async def plan(req: PlanRequest):
 # ---------- Build Agent streaming ----------
 
 class BuildRequest(BaseModel):
-    spec_path: str
+    spec_path: Optional[str] = None
+    spec_id: Optional[str] = None
     dry_run: bool = False
 
 
 WORKFLOW_ID_RE = None  # compiled lazily
 
 
+async def _tag_workflow_owner(workflow_id: str, user_id: str):
+    """Add a `vibe_owner:<user_id>` tag to the n8n workflow (best-effort).
+
+    The `workflow_owners` row is authoritative; the tag is only here to give
+    someone debugging in the n8n UI a hint of who owns what.
+    """
+    try:
+        wf = await n8n_get(f'/api/v1/workflows/{workflow_id}')
+        existing = wf.get('tags') or []
+        tag = f'vibe_owner:{user_id}'
+        if any(isinstance(t, dict) and t.get('name') == tag for t in existing):
+            return
+        new_tags = list(existing) + [{'name': tag}]
+        await n8n_request('PATCH', f'/api/v1/workflows/{workflow_id}', body={'tags': new_tags})
+    except Exception:
+        # Tag is cosmetic; don't fail the build over it.
+        pass
+
+
 @app.post('/api/build')
-async def build(req: BuildRequest):
-    """Run Build Agent on a spec file. Streams stdout as SSE. Final event includes workflow_id."""
+async def build(req: BuildRequest, request: Request):
+    """Run Build Agent on a spec. Streams stdout as SSE.
+
+    Multi-user mode: pass `spec_id` (UUID); the spec is loaded from DB,
+    written to a temp file, built, then ownership + build row are recorded
+    and the n8n workflow is tagged.
+
+    Single-user mode: pass `spec_path` (project-relative).
+    """
     import re
     global WORKFLOW_ID_RE
     if WORKFLOW_ID_RE is None:
         WORKFLOW_ID_RE = re.compile(r'Workflow deployed:\s*(\S+)')
 
-    sp = _safe_project_path(req.spec_path)
-    if not sp.exists():
-        raise HTTPException(400, f'spec not found: {req.spec_path}')
+    user_id = await _user_or_none(request)
+
+    # Resolve a real on-disk path for the subprocess.
+    spec_data: Optional[dict] = None
+    spec_id: Optional[str] = None
+    cleanup_tmp = False
+
+    if user_id is not None:
+        if not req.spec_id:
+            raise HTTPException(400, 'spec_id is required in multi-user mode')
+        record = await storage.get_spec(req.spec_id, user_id)
+        if record is None:
+            raise HTTPException(404, 'spec not found')
+        spec_data = record['spec']
+        spec_id = record['id']
+        tmp = PROJECT_ROOT / 'build-logs' / f'build-{uuid.uuid4().hex[:12]}-spec.json'
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(spec_data), encoding='utf-8')
+        sp = tmp
+        cleanup_tmp = True
+    else:
+        if not req.spec_path:
+            raise HTTPException(400, 'spec_path is required in single-user mode')
+        sp = _safe_project_path(req.spec_path)
+        if not sp.exists():
+            raise HTTPException(400, f'spec not found: {req.spec_path}')
 
     cmd = [sys.executable, '-m', 'agents.build_agent', 'build', str(sp)]
     if req.dry_run:
@@ -688,21 +810,61 @@ async def build(req: BuildRequest):
         'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'kind': 'build',
         'spec_path': req.spec_path,
+        'spec_id': spec_id,
         'dry_run': req.dry_run,
+        'user_id': user_id,
     })
 
     async def event_stream():
-        workflow_id = None
-        rc = None
-        async for kind, payload in _stream_subprocess(cmd):
-            if kind == '_exit':
-                rc = payload
-            else:
-                yield _sse(kind, payload)
-                if workflow_id is None:
-                    m = WORKFLOW_ID_RE.search(payload.get('line', ''))
-                    if m:
-                        workflow_id = m.group(1)
+        build_id: Optional[str] = None
+        if user_id is not None and not req.dry_run:
+            try:
+                build_id = await storage.start_build(user_id, spec_id)
+            except Exception:
+                build_id = None
+
+        workflow_id: Optional[str] = None
+        rc: Optional[int] = None
+        log_lines: list[str] = []
+
+        try:
+            async for kind, payload in _stream_subprocess(cmd):
+                if kind == '_exit':
+                    rc = payload
+                else:
+                    yield _sse(kind, payload)
+                    line = payload.get('line', '')
+                    log_lines.append(line)
+                    if workflow_id is None:
+                        m = WORKFLOW_ID_RE.search(line)
+                        if m:
+                            workflow_id = m.group(1)
+        finally:
+            if cleanup_tmp:
+                try:
+                    sp.unlink()
+                except OSError:
+                    pass
+
+        if user_id is not None and workflow_id and not req.dry_run:
+            try:
+                await storage.claim_workflow(user_id, workflow_id)
+            except Exception:
+                pass
+            await _tag_workflow_owner(workflow_id, user_id)
+
+        if build_id is not None:
+            status = 'success' if rc == 0 and workflow_id else 'failed'
+            try:
+                await storage.finish_build(
+                    build_id,
+                    status=status,
+                    exit_code=rc,
+                    n8n_workflow_id=workflow_id,
+                    log='\n'.join(log_lines)[-100_000:],  # cap at 100KB
+                )
+            except Exception:
+                pass
 
         edit_url = f'{N8N_PUBLIC_URL}/workflow/{workflow_id}' if workflow_id else None
         yield _sse('done', {
