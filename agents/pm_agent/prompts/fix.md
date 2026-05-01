@@ -29,6 +29,10 @@ If the branch logic is complex (multiple checks, null guards, type coercion), us
 
 **Webhook triggers with `respondToWebhook` nodes: responseMode is auto-set.** Do not specify `responseMode: 'lastNode'` when the workflow contains any `n8n-nodes-base.respondToWebhook` step. The Build Agent sets `responseMode: 'responseNode'` automatically so the trigger waits for the respondToWebhook node instead of using whichever node ran last.
 
+**No Merge nodes.** The Build Agent wires steps sequentially and does not support parallel fan-out/merge. If a finding flags a Merge node (`n8n-nodes-base.merge`), remove it: combine the parallel branches into one Code node that makes the same fetches sequentially, or restructure as a linear chain of httpRequest nodes followed by a Code node that aggregates from `$input.all()` (where each upstream is the prior step in the chain). Never reach for `n8n-nodes-base.merge` — the validator will reject it.
+
+**Every LLM step (`determinism: "3.0"`) needs a gate after it.** If a finding reports an LLM step missing a gate, add an IF gate immediately after the LLM call to validate the response shape (e.g. `={{ $json.choices[0].message.content }}` is non-empty, or a parsed-success flag from a Code node). Route the fail branch to a Slack/error step, the pass branch to the next normal step.
+
 ## Test case contract
 
 - `expected` is a **flat dict**. Never nest response fields under `body`. To assert the HTTP status, use `http_status` (snake_case) — not `httpStatus`. Example: `{"http_status": 400, "status": "error", "message": "..."}`.

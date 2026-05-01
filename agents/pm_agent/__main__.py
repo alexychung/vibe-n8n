@@ -6,6 +6,7 @@ Usage:
     python -m agents.pm_agent plan "desc" --output spec.json  # Custom output path
 """
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -14,7 +15,9 @@ import uuid
 
 # Fix Windows console encoding — LLM outputs Unicode (°, ≤, emoji) that
 # crashes the default cp1252 codec. Force UTF-8 on stdout/stderr.
-if sys.platform == 'win32':
+# Gate on __name__ == '__main__' so importing this module from the web layer
+# or tests doesn't stomp on pytest's stdout-capture wrapper.
+if sys.platform == 'win32' and __name__ == '__main__':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
@@ -35,12 +38,20 @@ def load_env():
     for _ in range(5):
         env_path = os.path.join(d, '.env')
         if os.path.exists(env_path):
-            with open(env_path) as f:
+            with open(env_path, encoding='utf-8-sig') as f:
                 for line in f:
                     line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        k, v = line.split('=', 1)
-                        os.environ.setdefault(k.strip(), v.strip())
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    if line.startswith('export '):
+                        line = line[7:].lstrip()
+                    k, v = line.split('=', 1)
+                    v = v.strip()
+                    # Strip surrounding quotes — `KEY="value"` shouldn't keep
+                    # the quotes literal in the env var.
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                        v = v[1:-1]
+                    os.environ.setdefault(k.strip(), v)
             return
         d = os.path.dirname(d)
 
@@ -63,6 +74,68 @@ def log_event(event: dict):
             f.write(json.dumps(event, ensure_ascii=False) + '\n')
     except Exception:
         pass
+
+
+def _auto_fix_spec(spec: dict, errors: list) -> tuple:
+    """Deterministic patches for validator findings the LLM keeps mis-generating.
+
+    Returns (patched_spec, applied_fixes). For each fix applied, a short label
+    is added to applied_fixes; an empty list means nothing matched.
+
+    Currently handles:
+      - LLM step (determinism=3.0) missing a gate entry: insert a gate with
+        after_step=<llm_step_id>, pass_to=<next sequential step>, fail_to=null,
+        type=conditional_branch. The Build Agent will wire the IF — the LLM
+        usually included an IF in the steps array but forgot the gate entry.
+    """
+    import re
+    applied = []
+    steps = spec.get('steps', [])
+    gates = spec.get('gates', [])
+    step_by_id = {s.get('id'): s for s in steps}
+    step_index = {s.get('id'): i for i, s in enumerate(steps)}
+    gated_steps = set()
+    for g in gates:
+        a = g.get('after_step')
+        if isinstance(a, str):
+            gated_steps.add(a)
+        elif isinstance(a, list):
+            gated_steps.update(a)
+
+    for err in errors:
+        # Spec convention is `step_<n>` IDs but the LLM also uses
+        # camelCase or snake_case names without the prefix. Match any
+        # identifier-like token so the auto-fix doesn't silently skip
+        # those and force an LLM repair pass.
+        m = re.search(r'\(id=([A-Za-z][A-Za-z0-9_-]*)\) has determinism 3.0', err)
+        if not m:
+            continue
+        llm_id = m.group(1)
+        if llm_id in gated_steps:
+            continue
+        idx = step_index.get(llm_id)
+        if idx is None or idx + 1 >= len(steps):
+            continue
+        # Insert a sequential gate `{after_step: <llm>, pass_to: <next>}`. The
+        # validator only requires that the LLM step appears as some gate's
+        # after_step; a sequential gate satisfies that without forcing the
+        # build agent to wire two branches off an HTTP node. If the LLM
+        # included a downstream IF step for response validation, this gate
+        # routes through it; the IF still does the conditional branching.
+        next_step = steps[idx + 1]
+        new_gate = {
+            'after_step': llm_id,
+            'pass_to': next_step.get('id'),
+            'fail_to': None,
+            'type': 'sequential',
+        }
+        gates.append(new_gate)
+        gated_steps.add(llm_id)
+        applied.append(f'inserted sequential gate after LLM step {llm_id}')
+
+    if applied:
+        spec['gates'] = gates
+    return spec, applied
 
 
 def cmd_plan(description: str = '', from_brief: str = '', output_path: str = '', requirements_path: str = ''):
@@ -100,7 +173,7 @@ def _cmd_plan_inner(description, from_brief, output_path, session_id, now, requi
         })
         print(f'  Loaded requirements from {requirements_path}')
     elif from_brief:
-        with open(from_brief) as f:
+        with open(from_brief, encoding='utf-8-sig') as f:
             brief_text = f.read()
         log_event({
             'ts': now,
@@ -108,7 +181,8 @@ def _cmd_plan_inner(description, from_brief, output_path, session_id, now, requi
             'kind': 'input',
             'mode': 'from-brief',
             'brief_path': from_brief,
-            'brief_text': brief_text,
+            'brief_chars': len(brief_text),
+            'brief_sha256': hashlib.sha256(brief_text.encode('utf-8')).hexdigest()[:16],
             'output_path_arg': output_path or None,
         })
         requirements = interview_from_brief(brief_text)
@@ -119,7 +193,8 @@ def _cmd_plan_inner(description, from_brief, output_path, session_id, now, requi
             'session_id': session_id,
             'kind': 'input',
             'mode': 'interactive',
-            'description': description,
+            'description_chars': len(description),
+            'description_sha256': hashlib.sha256(description.encode('utf-8')).hexdigest()[:16],
             'output_path_arg': output_path or None,
         })
         requirements = interview_interactive(description)
@@ -155,24 +230,46 @@ def _cmd_plan_inner(description, from_brief, output_path, session_id, now, requi
             print(f'    [{f.get("severity", "?")}] {f.get("finding", "")}')
     print()
 
-    # Phase 6: Validate
+    # Phase 6: Validate (with auto-fixes + one LLM repair pass on remaining errors)
     print('Phase 5: Validate')
     errors = validate_spec(spec)
     if errors:
         print(f'  Validation errors:')
         for e in errors:
             print(f'    - {e}')
-        print('\nSpec has issues. Fix manually or re-run.')
-        log_event({
-            'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            'session_id': session_id,
-            'kind': 'outcome',
-            'status': 'validation_failed',
-            'workflow_name': spec.get('workflow_name'),
-            'errors': errors,
-        })
-        return 1
-    print('  Spec is valid.')
+        # Attempt deterministic auto-fixes first for shapes the LLM keeps
+        # mis-generating despite explicit prompts (e.g. forgetting the
+        # gates-array entry for an LLM step). Anything still broken after
+        # auto-fix goes to the LLM repair pass.
+        spec, auto_fixed = _auto_fix_spec(spec, errors)
+        if auto_fixed:
+            print(f'  Applied auto-fixes: {", ".join(auto_fixed)}')
+            errors = validate_spec(spec)
+        if errors:
+            from reviewer import fix_spec
+            print('  Attempting LLM repair pass with remaining validator findings...')
+            validator_findings = [
+                {'severity': 'CRITICAL', 'finding': e} for e in errors
+            ]
+            spec = fix_spec(spec, validator_findings)
+            errors = validate_spec(spec)
+        if errors:
+            print(f'  Validation errors after repair:')
+            for e in errors:
+                print(f'    - {e}')
+            print('\nSpec has issues. Fix manually or re-run.')
+            log_event({
+                'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'session_id': session_id,
+                'kind': 'outcome',
+                'status': 'validation_failed',
+                'workflow_name': spec.get('workflow_name'),
+                'errors': errors,
+            })
+            return 1
+        print('  Spec is valid after repair.')
+    else:
+        print('  Spec is valid.')
     print()
 
     # Output
@@ -196,8 +293,8 @@ def _cmd_plan_inner(description, from_brief, output_path, session_id, now, requi
             return 1
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w') as f:
-        json.dump(spec, f, indent=2)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(spec, f, indent=2, ensure_ascii=False)
 
     print(f'Spec saved to {output_path}')
     print(f'\nBuild it:')

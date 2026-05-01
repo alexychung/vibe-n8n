@@ -22,7 +22,7 @@ def review(spec: dict, requirements: dict) -> list[dict]:
         spec=json.dumps(spec, indent=2),
     )
 
-    findings = call_json(REVIEW_MODEL, system_prompt, 'Review this spec and return findings as a JSON array.', max_tokens=16384)
+    findings = call_json(REVIEW_MODEL, system_prompt, 'Review this spec and return findings as a JSON array.', max_tokens=32768)
 
     # The LLM should return a list, but handle the case where it wraps in an object
     if isinstance(findings, dict):
@@ -63,7 +63,7 @@ def fix_spec(spec: dict, findings: list[dict]) -> dict:
     updated = call_json(FIX_MODEL, system_prompt,
                          'Apply the fixes and return the complete updated spec as a single JSON object. '
                          'The response must be one JSON object with workflow_name, steps, gates, test_cases, etc.',
-                         max_tokens=16384)
+                         max_tokens=32768)
 
     # Handle LLM returning a list instead of a dict
     if isinstance(updated, list):
@@ -80,6 +80,14 @@ def fix_spec(spec: dict, findings: list[dict]) -> dict:
                 # Last resort: return the original spec unchanged
                 print(f'  Warning: fix_spec got a list of {len(updated)} items instead of a spec dict, keeping original spec')
                 return spec
+
+    # Sanity check the LLM didn't drop required top-level fields. The list-
+    # unwrap branch above already checks `workflow_name` + `steps`; the dict
+    # path doesn't, so a response like `{"workflow_name": "..."}` would be
+    # accepted as a "fix" that actually destroys the spec.
+    if not isinstance(updated, dict) or 'steps' not in updated or not updated.get('steps'):
+        print('  Warning: fix_spec response missing or empty steps array, keeping original spec')
+        return spec
 
     # Strip connections field — build agent infers wiring from step order + gates
     updated.pop('connections', None)

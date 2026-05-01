@@ -27,7 +27,7 @@ def decompose(requirements: dict, audit_summary: str) -> dict:
     )
 
     # First attempt
-    spec = call_json(DECOMPOSE_MODEL, system_prompt, 'Produce the workflow spec JSON now.', max_tokens=16384)
+    spec = call_json(DECOMPOSE_MODEL, system_prompt, 'Produce the workflow spec JSON now.', max_tokens=32768)
     spec = _unwrap_spec(spec)
 
     # Translate pseudocode params to n8n format
@@ -44,7 +44,7 @@ def decompose(requirements: dict, audit_summary: str) -> dict:
         + '\n'.join(f'- {e}' for e in errors)
         + '\n\nFix these errors and return the corrected spec JSON.'
     )
-    spec = call_json(DECOMPOSE_MODEL, system_prompt, retry_msg, max_tokens=16384)
+    spec = call_json(DECOMPOSE_MODEL, system_prompt, retry_msg, max_tokens=32768)
     spec = _unwrap_spec(spec)
     spec = _translate_spec_params(spec)
 

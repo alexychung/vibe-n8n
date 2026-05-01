@@ -37,7 +37,15 @@ def validate_spec(raw: dict) -> list[str]:
         if step.determinism == '3.0' and step.id not in gated_steps:
             errors.append(
                 f'Step "{step.name}" (id={step.id}) has determinism 3.0 (LLM) '
-                f'but no gate after it. Add a validation gate.'
+                f'but is not registered in the `gates` array. Add a gate entry: '
+                f'{{"after_step": "{step.id}", "pass_to": "<id of next normal step>", '
+                f'"fail_to": "<id of an error/alert step>", "type": "conditional_branch"}}. '
+                f'Also add an IF step (n8n-nodes-base.if) immediately after {step.id} in the '
+                f'steps array that validates the LLM response shape (e.g. checks '
+                f'`={{ $json.choices[0].message.content }}` is non-empty or a parse_success flag '
+                f'from a Code node). The IF step\'s id should be the gate\'s after_step or you '
+                f'must point pass_to/fail_to at the IF\'s output targets — the gate entry tells '
+                f'the Build Agent how to wire branches.'
             )
 
     # 3. IF nodes must not have empty conditions
