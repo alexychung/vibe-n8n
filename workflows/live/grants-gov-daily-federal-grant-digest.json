@@ -1,0 +1,583 @@
+{
+  "name": "Grants.gov Daily Federal Grant Digest",
+  "nodes": [
+    {
+      "id": "trigger",
+      "name": "Cron Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 2,
+      "position": [
+        250,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "step_1",
+      "name": "Fetch Grants - Workforce Development",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.grants.gov/v2/opportunities/search",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "query": "workforce development OR job training OR employment",
+          "oppStatuses": [
+            "forecasted",
+            "posted"
+          ],
+          "rows": 100,
+          "sortBy": "openDate",
+          "sortOrder": "desc"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_1b",
+      "name": "Fetch Grants - Rural Broadband",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        750,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.grants.gov/v2/opportunities/search",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "query": "rural broadband OR broadband connectivity OR internet access",
+          "oppStatuses": [
+            "forecasted",
+            "posted"
+          ],
+          "rows": 100,
+          "sortBy": "openDate",
+          "sortOrder": "desc"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_1c",
+      "name": "Fetch Grants - Veteran Services",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1000,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.grants.gov/v2/opportunities/search",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "query": "veteran services OR veterans OR military",
+          "oppStatuses": [
+            "forecasted",
+            "posted"
+          ],
+          "rows": 100,
+          "sortBy": "openDate",
+          "sortOrder": "desc"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_1d",
+      "name": "Fetch Grants - Early Childhood Education",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1250,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.grants.gov/v2/opportunities/search",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "query": "early childhood education OR preschool OR head start OR child care",
+          "oppStatuses": [
+            "forecasted",
+            "posted"
+          ],
+          "rows": 100,
+          "sortBy": "openDate",
+          "sortOrder": "desc"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_1e",
+      "name": "Merge and Deduplicate API Responses",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1500,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const allItems = $input.all();\n\nfunction extractHits(responseJson) {\n  if (responseJson && responseJson.data) {\n    if (Array.isArray(responseJson.data.hits)) return responseJson.data.hits;\n    if (Array.isArray(responseJson.data.opportunities)) return responseJson.data.opportunities;\n    if (Array.isArray(responseJson.data.oppHits)) return responseJson.data.oppHits;\n    if (Array.isArray(responseJson.data)) return responseJson.data;\n  }\n  if (Array.isArray(responseJson.oppHits)) return responseJson.oppHits;\n  if (Array.isArray(responseJson.opportunities)) return responseJson.opportunities;\n  if (Array.isArray(responseJson.searchResult)) return responseJson.searchResult;\n  if (Array.isArray(responseJson.hits)) return responseJson.hits;\n  return null;\n}\n\nconst seen = new Set();\nconst mergedHits = [];\nlet totalRawCount = 0;\nlet envelopeUnrecognizedCount = 0;\nlet allQueriesZeroHits = true;\n\nfor (const item of allItems) {\n  const rj = item.json;\n  const hits = extractHits(rj);\n  if (hits === null) {\n    envelopeUnrecognizedCount++;\n    continue;\n  }\n  if (hits.length > 0) allQueriesZeroHits = false;\n  totalRawCount += hits.length;\n  for (const grant of hits) {\n    const key = grant.oppNumber || grant.id || JSON.stringify(grant).substring(0, 60);\n    if (!seen.has(key)) {\n      seen.add(key);\n      mergedHits.push(grant);\n    }\n  }\n}\n\nif (envelopeUnrecognizedCount === allItems.length) {\n  throw new Error(`Grants.gov API response envelope unrecognized across all ${allItems.length} fetch calls. Raw response keys: ${Object.keys(allItems[0]?.json || {}).join(', ')}. Investigate API schema change.`);\n}\n\nif (allQueriesZeroHits && allItems.length > 0 && envelopeUnrecognizedCount < allItems.length) {\n  throw new Error(`All ${allItems.length} Grants.gov queries returned 0 hits. Possible query parameter mismatch (e.g. oppStatuses format) or API filter issue. Investigate request body schema.`);\n}\n\nconst firstGrantKeys = mergedHits.length > 0 ? Object.keys(mergedHits[0]).join(', ') : 'no grants';\n\nreturn [{\n  json: {\n    hits: mergedHits,\n    totalRawCount,\n    deduplicatedCount: mergedHits.length,\n    envelopeUnrecognizedCount,\n    firstGrantKeys\n  }\n}];"
+      }
+    },
+    {
+      "id": "step_2",
+      "name": "Filter and Classify Grants by Hard Criteria",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1750,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const today = new Date();\ntoday.setHours(0,0,0,0);\n\nconst FOCUS_CATEGORIES = {\n  'workforce development': ['workforce development', 'workforce', 'job training', 'employment'],\n  'rural broadband': ['rural broadband', 'broadband', 'rural connectivity', 'internet access'],\n  'veteran services': ['veteran', 'veterans services', 'military'],\n  'early childhood education': ['early childhood', 'early childhood education', 'preschool', 'head start', 'child care']\n};\n\nfunction matchesFocusArea(grant) {\n  const searchText = [\n    (grant.oppTitle || grant.title || ''),\n    (grant.synopsis || grant.description || ''),\n    (grant.agencyName || grant.agency || ''),\n    (grant.CFDANumbers || ''),\n    (grant.oppNumber || grant.id || '')\n  ].join(' ').toLowerCase();\n  const matched = [];\n  for (const [category, keywords] of Object.entries(FOCUS_CATEGORIES)) {\n    if (keywords.some(kw => searchText.includes(kw))) {\n      matched.push(category);\n    }\n  }\n  return matched;\n}\n\nfunction getFundingCeiling(grant) {\n  const raw = grant.awardCeiling\n    || grant.award_ceiling\n    || grant.estimatedTotalProgramFunding\n    || grant.estimated_total_program_funding\n    || grant.totalFunding\n    || grant.total_funding\n    || 0;\n  return typeof raw === 'string' ? parseFloat(raw.replace(/[^0-9.]/g, '')) || 0 : Number(raw) || 0;\n}\n\nfunction getDaysUntilDeadline(grant) {\n  const raw = grant.closeDate\n    || grant.close_date\n    || grant.closingDate\n    || grant.archiveDate\n    || grant.archive_date\n    || '';\n  if (!raw) return -1;\n  const deadline = new Date(raw);\n  if (isNaN(deadline.getTime())) return -1;\n  const diffMs = deadline.getTime() - today.getTime();\n  return Math.floor(diffMs / (1000 * 60 * 60 * 24));\n}\n\nfunction getGrantTitle(grant) {\n  return grant.oppTitle || grant.title || grant.opportunity_title || 'Untitled';\n}\n\nfunction getAgency(grant) {\n  return grant.agencyName || grant.agency_name || grant.agencyCode || grant.agency || 'Unknown Agency';\n}\n\nfunction getDeadlineRaw(grant) {\n  return grant.closeDate || grant.close_date || grant.closingDate || grant.archiveDate || grant.archive_date || 'Unknown';\n}\n\nfunction getGrantId(grant) {\n  return grant.oppNumber || grant.opp_number || grant.id || grant.opportunity_id || '';\n}\n\nfunction getSynopsis(grant) {\n  return (grant.synopsis || grant.description || grant.summary || '').substring(0, 500);\n}\n\nconst rawData = $input.first().json;\nconst hits = rawData.hits || [];\n\nlet deadlineSchemaWarning = null;\n\nif (hits.length > 0) {\n  const allZeroCeiling = hits.every(g => getFundingCeiling(g) === 0);\n  const allInvalidDeadline = hits.every(g => getDaysUntilDeadline(g) === -1);\n\n  if (allZeroCeiling && allInvalidDeadline) {\n    throw new Error(`Schema parse failure: All ${hits.length} grants returned ceiling=0 and daysLeft=-1. Likely API field name change. First grant keys: ${rawData.firstGrantKeys}. Investigate Grants.gov v2 field mapping.`);\n  }\n\n  if (allInvalidDeadline && !allZeroCeiling) {\n    deadlineSchemaWarning = `SCHEMA DRIFT WARNING: All ${hits.length} grants have unreadable deadline fields (daysLeft=-1) but funding ceilings are readable. Deadline field name may have changed. All grants will fail the deadline filter, producing an empty digest. Investigate Grants.gov v2 deadline field mapping. First grant keys: ${rawData.firstGrantKeys}`;\n  }\n}\n\nconst qualifying = [];\nconst borderline = [];\nconst skipped = [];\n\nfor (const grant of hits) {\n  const matchedAreas = matchesFocusArea(grant);\n  const ceiling = getFundingCeiling(grant);\n  const daysLeft = getDaysUntilDeadline(grant);\n  const grantId = getGrantId(grant);\n\n  const focusPass = matchedAreas.length > 0;\n  const ceilingPass = ceiling >= 250000;\n  const deadlinePass = daysLeft >= 21;\n\n  const passCount = [focusPass, ceilingPass, deadlinePass].filter(Boolean).length;\n\n  let grantsGovLink;\n  if (grantId) {\n    grantsGovLink = `https://www.grants.gov/search-results-detail/${grantId}`;\n  } else {\n    grantsGovLink = 'https://www.grants.gov/search-results';\n  }\n\n  const enriched = {\n    oppNumber: grantId,\n    title: getGrantTitle(grant),\n    agency: getAgency(grant),\n    fundingCeiling: ceiling,\n    deadlineDate: getDeadlineRaw(grant),\n    daysUntilDeadline: daysLeft,\n    matchedFocusAreas: matchedAreas,\n    grantsGovLink,\n    synopsis: getSynopsis(grant),\n    focusPass,\n    ceilingPass,\n    deadlinePass\n  };\n\n  if (passCount === 3) {\n    qualifying.push(enriched);\n  } else if (passCount === 2) {\n    borderline.push(enriched);\n  } else {\n    skipped.push(enriched.oppNumber);\n  }\n}\n\nreturn [{\n  json: {\n    qualifying,\n    borderline,\n    skippedCount: skipped.length,\n    totalEvaluated: hits.length,\n    hasQualifying: qualifying.length > 0,\n    runDate: today.toISOString().split('T')[0],\n    parseFailure: false,\n    deadlineSchemaWarning\n  }\n}];"
+      }
+    },
+    {
+      "id": "step_3",
+      "name": "Check If Any Qualifying Grants Found",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.hasQualifying }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_4",
+      "name": "Generate OpenAI Fit Blurbs for Qualifying Grants",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2250,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst allQualifying = data.qualifying || [];\n// Cap at 10 grants to avoid timeout\nconst qualifying = allQualifying.slice(0, 10);\n\nconst OPENAI_API_KEY = $env.OPENAI_API_KEY;\n\nfunction sleep(ms) {\n  return new Promise(resolve => setTimeout(resolve, ms));\n}\n\nasync function callOpenAIWithRetry(prompt, retryOn429 = true) {\n  const requestOptions = {\n    method: 'POST',\n    url: 'https://api.openai.com/v1/chat/completions',\n    headers: {\n      'Content-Type': 'application/json',\n      'Authorization': `Bearer ${OPENAI_API_KEY}`\n    },\n    body: {\n      model: 'gpt-4o-mini',\n      messages: [{ role: 'user', content: prompt }],\n      max_tokens: 150,\n      temperature: 0.7\n    },\n    json: true\n  };\n\n  let response;\n  try {\n    response = await $http.request(requestOptions);\n  } catch (err) {\n    // Check if it was a 429 and retry once after 2s\n    if (retryOn429 && err.message && err.message.includes('429')) {\n      await sleep(2000);\n      return callOpenAIWithRetry(prompt, false);\n    }\n    throw err;\n  }\n  return response;\n}\n\nasync function generateBlurb(grant) {\n  const focusAreaList = grant.matchedFocusAreas.join(', ');\n  const ceilingFormatted = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(grant.fundingCeiling);\n\n  const prompt = `You are a grants writer for a nonprofit focused on workforce development, rural broadband, veteran services, and early childhood education. Write a compelling 2-3 sentence blurb explaining why this federal grant is a strong fit for our organization. Be specific about the focus area alignment, NOT generic. Do not start with \"This grant\".\n\nGrant Title: ${grant.title}\nAgency: ${grant.agency}\nFunding Ceiling: ${ceilingFormatted}\nDeadline: ${grant.deadlineDate} (${grant.daysUntilDeadline} days away)\nMatched Focus Areas: ${focusAreaList}\nSynopsis excerpt: ${grant.synopsis}\n\nWrite the 2-3 sentence blurb:`;\n\n  const result = await callOpenAIWithRetry(prompt);\n  return result.choices?.[0]?.message?.content?.trim() || null;\n}\n\nconst enrichedGrants = [];\nlet openaiSuccessCount = 0;\nlet fallbackCount = 0;\n\nfor (let i = 0; i < qualifying.length; i++) {\n  const grant = qualifying[i];\n  // 200ms delay between calls (skip before first call)\n  if (i > 0) {\n    await sleep(200);\n  }\n\n  let blurb;\n  let blurbSource;\n  try {\n    const generated = await generateBlurb(grant);\n    if (generated && generated.length >= 50) {\n      blurb = generated;\n      blurbSource = 'openai';\n      openaiSuccessCount++;\n    } else {\n      throw new Error('Generated blurb too short or null');\n    }\n  } catch (e) {\n    blurb = `Strong alignment with ${grant.matchedFocusAreas.join(' and ')} focus areas. Funding ceiling of $${grant.fundingCeiling.toLocaleString()} meets program threshold. Deadline in ${grant.daysUntilDeadline} days.`;\n    blurbSource = 'fallback';\n    fallbackCount++;\n  }\n  enrichedGrants.push({ ...grant, blurb, blurbSource });\n}\n\nconst allBlurbsFailed = qualifying.length > 0 && fallbackCount === qualifying.length;\n\nreturn [{\n  json: {\n    qualifying: enrichedGrants,\n    borderline: data.borderline,\n    skippedCount: data.skippedCount,\n    totalEvaluated: data.totalEvaluated,\n    runDate: data.runDate,\n    deadlineSchemaWarning: data.deadlineSchemaWarning || null,\n    blurbsGenerated: true,\n    openaiSuccessCount,\n    fallbackCount,\n    allBlurbsFailed\n  }\n}];"
+      }
+    },
+    {
+      "id": "step_5",
+      "name": "Validate Blurbs and Decide Quality Gate Flag",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2500,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst qualifying = data.qualifying || [];\n\nlet blurbsValid = true;\nlet blurbsValidReason = 'All blurbs meet length threshold';\nlet blurbAlertLevel = null;\nlet useBlurbFallbackPath = false;\n\nif (data.allBlurbsFailed === true) {\n  // OpenAI is completely down - soft WARNING path: post digest with fallback blurbs + warning\n  // Do NOT treat as hard ERROR (reserve ERROR for data pipeline failures)\n  blurbsValid = true; // allow digest to proceed with fallback blurbs\n  blurbAlertLevel = 'WARNING';\n  blurbsValidReason = 'All blurbs used fallback template - OpenAI API may be down. Digest posted with template blurbs.';\n  useBlurbFallbackPath = true;\n} else {\n  let invalidCount = 0;\n  for (const grant of qualifying) {\n    if (!grant.blurb || grant.blurb.length < 50) {\n      blurbsValid = false;\n      invalidCount++;\n    }\n  }\n  if (!blurbsValid) {\n    blurbsValidReason = `${invalidCount} blurb(s) below 50-char threshold`;\n  }\n}\n\nreturn [{\n  json: {\n    ...data,\n    blurbsValid,\n    blurbsValidReason,\n    blurbAlertLevel,\n    useBlurbFallbackPath\n  }\n}];"
+      }
+    },
+    {
+      "id": "step_6",
+      "name": "Check Blurb Quality Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2750,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.blurbsValid }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_7",
+      "name": "Format Full Digest Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3000,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst qualifying = data.qualifying || [];\nconst borderline = data.borderline || [];\nconst runDate = data.runDate || new Date().toISOString().split('T')[0];\n\nconst formatCurrency = (n) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n);\n\nconst items = qualifying.map(g => ({\n  title: g.title,\n  agency: g.agency,\n  fundingCeiling: formatCurrency(g.fundingCeiling),\n  fundingCeilingRaw: g.fundingCeiling,\n  deadline: g.deadlineDate,\n  daysUntilDeadline: g.daysUntilDeadline,\n  focusAreas: g.matchedFocusAreas,\n  grantsGovLink: g.grantsGovLink,\n  blurb: g.blurb,\n  blurbSource: g.blurbSource\n}));\n\nconst borderlineItems = borderline.map(g => ({\n  title: g.title,\n  agency: g.agency,\n  fundingCeiling: formatCurrency(g.fundingCeiling),\n  deadline: g.deadlineDate,\n  daysUntilDeadline: g.daysUntilDeadline,\n  focusAreas: g.matchedFocusAreas,\n  grantsGovLink: g.grantsGovLink,\n  missedCriteria: [\n    !g.focusPass ? 'focus area mismatch' : null,\n    !g.ceilingPass ? `funding ceiling below $250k (${formatCurrency(g.fundingCeiling)})` : null,\n    !g.deadlinePass ? `deadline within 21 days (${g.daysUntilDeadline} days)` : null\n  ].filter(Boolean)\n}));\n\nconst hasFallbackBlurbs = (data.fallbackCount || 0) > 0;\nlet blurbWarning = null;\nif (data.useBlurbFallbackPath) {\n  blurbWarning = `WARNING: All ${items.length} blurb(s) used fallback template - OpenAI API may be down. Review blurbs before sharing.`;\n} else if (hasFallbackBlurbs) {\n  blurbWarning = `Note: ${data.fallbackCount} of ${items.length} blurb(s) used fallback template (OpenAI partial failure).`;\n}\n\nconst summary = `Grant Digest for ${runDate}: ${items.length} qualifying grant(s) found across ${data.totalEvaluated} evaluated. Focus areas: workforce development, rural broadband, veteran services, early childhood education. Funding threshold: $250k+. Deadline window: 21+ days out.`;\n\nconst alertLevel = data.blurbAlertLevel || null;\n\nreturn [{\n  json: {\n    summary,\n    items,\n    borderline: borderlineItems,\n    meta: {\n      runDate,\n      totalEvaluated: data.totalEvaluated,\n      qualifyingCount: items.length,\n      borderlineCount: borderlineItems.length,\n      skippedCount: data.skippedCount,\n      openaiSuccessCount: data.openaiSuccessCount,\n      fallbackCount: data.fallbackCount\n    },\n    blurbWarning,\n    alertLevel,\n    deadlineSchemaWarning: data.deadlineSchemaWarning || null,\n    isEmpty: false\n  }\n}];"
+      }
+    },
+    {
+      "id": "step_8",
+      "name": "Post Digest to Internal Slack Endpoint",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3250,
+        300
+      ],
+      "parameters": {
+        "url": "https://internal.gpsfed.example/slack/grants",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "={{ JSON.stringify($json) }}",
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_10b",
+      "name": "Reset Consecutive Empty Days Counter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3500,
+        300
+      ],
+      "parameters": {
+        "jsCode": "let staticData = $getWorkflowStaticData('global');\nstaticData.consecutiveEmptyDays = 0;\nreturn $input.all();"
+      }
+    },
+    {
+      "id": "step_10",
+      "name": "Post Empty Digest to Internal Slack Endpoint",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3750,
+        300
+      ],
+      "parameters": {
+        "url": "https://internal.gpsfed.example/slack/grants",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "={{ JSON.stringify($json) }}",
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_12",
+      "name": "Post Failure Alert to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4000,
+        300
+      ],
+      "parameters": {
+        "url": "https://internal.gpsfed.example/slack/grants",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "={{ JSON.stringify($json) }}",
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 2,
+            "waitBetweenTries": 1000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_9",
+      "name": "Build Empty Digest Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        450
+      ],
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst runDate = data.runDate || new Date().toISOString().split('T')[0];\n\nlet staticData = $getWorkflowStaticData('global');\nif (!staticData.consecutiveEmptyDays) staticData.consecutiveEmptyDays = 0;\nstaticData.consecutiveEmptyDays = (staticData.consecutiveEmptyDays || 0) + 1;\nconst consecutiveEmptyDays = staticData.consecutiveEmptyDays;\n\nconst borderlineItems = (data.borderline || []).map(g => ({\n  title: g.title,\n  agency: g.agency,\n  fundingCeiling: g.fundingCeiling,\n  deadline: g.deadlineDate,\n  daysUntilDeadline: g.daysUntilDeadline,\n  focusAreas: g.matchedFocusAreas,\n  grantsGovLink: g.grantsGovLink,\n  missedCriteria: [\n    !g.focusPass ? 'focus area mismatch' : null,\n    !g.ceilingPass ? 'funding ceiling below $250k' : null,\n    !g.deadlinePass ? `deadline within 21 days (${g.daysUntilDeadline} days)` : null\n  ].filter(Boolean)\n}));\n\nconst summary = `Grant Digest for ${runDate}: No grants meeting all criteria today (${data.totalEvaluated} evaluated). Focus areas: workforce development, rural broadband, veteran services, early childhood education.`;\n\nlet alertLevel = null;\nlet consecutiveWarning = null;\nif (consecutiveEmptyDays >= 3) {\n  alertLevel = 'WARNING';\n  consecutiveWarning = `Grant digest has returned zero qualifying results for ${consecutiveEmptyDays} consecutive business days \u2014 verify API connectivity and query parameters.`;\n}\n\nreturn [{\n  json: {\n    summary,\n    items: [],\n    borderline: borderlineItems,\n    isEmpty: true,\n    consecutiveEmptyDays,\n    alertLevel,\n    consecutiveWarning,\n    deadlineSchemaWarning: data.deadlineSchemaWarning || null,\n    meta: {\n      runDate,\n      totalEvaluated: data.totalEvaluated,\n      qualifyingCount: 0,\n      borderlineCount: borderlineItems.length,\n      skippedCount: data.skippedCount\n    }\n  }\n}];"
+      }
+    },
+    {
+      "id": "step_11",
+      "name": "Build Workflow Failure Alert Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3250,
+        450
+      ],
+      "parameters": {
+        "jsCode": "const inputData = $input.first().json;\n// In n8n error paths, the error message may appear in different fields depending on node type\nconst errorMessage = inputData.error\n  || inputData.message\n  || inputData.errorMessage\n  || 'Unknown error during grant digest workflow - check n8n execution log for details';\n\nreturn [{\n  json: {\n    summary: 'WORKFLOW FAILURE: Grants.gov daily digest failed to complete. Manual investigation required.',\n    items: [],\n    error: errorMessage,\n    alertLevel: 'ERROR',\n    runDate: new Date().toISOString().split('T')[0]\n  }\n}];"
+      }
+    }
+  ],
+  "connections": {
+    "Cron Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Grants - Workforce Development",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Grants - Workforce Development": {
+      "main": [
+        [
+          {
+            "node": "Fetch Grants - Rural Broadband",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Grants - Rural Broadband": {
+      "main": [
+        [
+          {
+            "node": "Fetch Grants - Veteran Services",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Grants - Veteran Services": {
+      "main": [
+        [
+          {
+            "node": "Fetch Grants - Early Childhood Education",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Grants - Early Childhood Education": {
+      "main": [
+        [
+          {
+            "node": "Merge and Deduplicate API Responses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge and Deduplicate API Responses": {
+      "main": [
+        [
+          {
+            "node": "Filter and Classify Grants by Hard Criteria",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter and Classify Grants by Hard Criteria": {
+      "main": [
+        [
+          {
+            "node": "Check If Any Qualifying Grants Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check If Any Qualifying Grants Found": {
+      "main": [
+        [
+          {
+            "node": "Generate OpenAI Fit Blurbs for Qualifying Grants",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Empty Digest Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate OpenAI Fit Blurbs for Qualifying Grants": {
+      "main": [
+        [
+          {
+            "node": "Validate Blurbs and Decide Quality Gate Flag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Blurbs and Decide Quality Gate Flag": {
+      "main": [
+        [
+          {
+            "node": "Check Blurb Quality Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Blurb Quality Gate": {
+      "main": [
+        [
+          {
+            "node": "Format Full Digest Payload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Workflow Failure Alert Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Full Digest Payload": {
+      "main": [
+        [
+          {
+            "node": "Post Digest to Internal Slack Endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Digest to Internal Slack Endpoint": {
+      "main": [
+        [
+          {
+            "node": "Reset Consecutive Empty Days Counter",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Workflow Failure Alert Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Empty Digest Payload": {
+      "main": [
+        [
+          {
+            "node": "Post Empty Digest to Internal Slack Endpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Workflow Failure Alert Payload": {
+      "main": [
+        [
+          {
+            "node": "Post Failure Alert to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 600,
+    "saveExecutionProgress": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  }
+}

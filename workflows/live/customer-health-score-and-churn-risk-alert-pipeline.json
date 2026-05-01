@@ -1,0 +1,1732 @@
+{
+  "name": "Customer Health Score and Churn Risk Alert Pipeline",
+  "nodes": [
+    {
+      "id": "trigger",
+      "name": "Runs Monday-Friday at 6:00 AM Pacific (14:00 UTC)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 2,
+      "position": [
+        250,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "step_1",
+      "name": "Schedule Trigger \u2013 Weekdays 6am Pacific",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 14 * * 1-5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_2",
+      "name": "Fetch Account List from CSM Directory API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        750,
+        300
+      ],
+      "parameters": {
+        "url": "https://internal-csm-api.example.com/accounts",
+        "method": "GET",
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          },
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "step_3",
+      "name": "Split Accounts Into Individual Items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst accounts = response.accounts || (response.body && response.body.accounts) || [];\nif (!accounts.length) throw new Error('No accounts returned from CSM directory API');\nreturn accounts.map(account => ({ json: { account_id: account.account_id, account_name: account.account_name, csm_email: account.csm_email, tier: account.tier || 'standard', stripe_customer_id: account.stripe_customer_id || '', zendesk_org_id: account.zendesk_org_id || account.account_id } }));"
+      }
+    },
+    {
+      "id": "step_3b",
+      "name": "Loop Over Accounts One at a Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1250,
+        300
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "step_4",
+      "name": "Rate-Limit Pacing Delay Between Accounts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1500,
+        300
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nawait new Promise(resolve => setTimeout(resolve, 300));\nreturn [{ json: item }];"
+      }
+    },
+    {
+      "id": "step_5",
+      "name": "Fetch Amplitude 30-Day Usage Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1750,
+        300
+      ],
+      "parameters": {
+        "url": "https://amplitude.com/api/2/events/segmentation",
+        "method": "GET",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "e",
+              "value": "={\"event_type\":\"Any Event\"}"
+            },
+            {
+              "name": "start",
+              "value": "={{ $now.minus({days: 30}).toFormat('yyyyMMdd') }}"
+            },
+            {
+              "name": "end",
+              "value": "={{ $now.toFormat('yyyyMMdd') }}"
+            },
+            {
+              "name": "s",
+              "value": "={{ '[{\"prop\":\"gp:account_id\",\"op\":\"is\",\"values\":[\"' + $json.account_id + '\"]}]' }}"
+            },
+            {
+              "name": "m",
+              "value": "uniques"
+            },
+            {
+              "name": "i",
+              "value": "1"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 2,
+            "waitBetweenTries": 10000
+          },
+          "timeout": 60000
+        }
+      }
+    },
+    {
+      "id": "step_5_check",
+      "name": "Gate \u2013 Amplitude Fetch Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.data !== undefined && $json.data !== null ? 'ok' : 'fail' }}",
+              "rightValue": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_6",
+      "name": "Parse Amplitude Usage Signals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2250,
+        300
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nconst ampData = item.data || (item.body && item.body.data) || null;\nlet amplitude_signals = { available: false, dau_avg: 0, dau_trend: 'unknown', session_count_30d: 0 };\ntry {\n  if (ampData && ampData.data && ampData.data.series) {\n    const series = ampData.data.series[0] || [];\n    const vals = series.map(function(d) { return d.value || 0; });\n    const avg = vals.length ? vals.reduce(function(a,b){ return a+b; }, 0) / vals.length : 0;\n    const recent = vals.slice(-7);\n    const older = vals.slice(0, 7);\n    const recentAvg = recent.length ? recent.reduce(function(a,b){ return a+b; }, 0) / recent.length : 0;\n    const olderAvg = older.length ? older.reduce(function(a,b){ return a+b; }, 0) / older.length : 0;\n    const trend = recentAvg >= olderAvg * 1.05 ? 'up' : recentAvg <= olderAvg * 0.95 ? 'down' : 'flat';\n    amplitude_signals = { available: true, dau_avg: Math.round(avg), dau_trend: trend, session_count_30d: vals.reduce(function(a,b){ return a+b; }, 0) };\n  }\n} catch(e) {\n  amplitude_signals = { available: false, dau_avg: 0, dau_trend: 'unknown', session_count_30d: 0 };\n}\nreturn [{ json: Object.assign({}, item, { amplitude_signals: amplitude_signals }) }];"
+      }
+    },
+    {
+      "id": "step_7",
+      "name": "Fetch Zendesk 30-Day Support Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2500,
+        300
+      ],
+      "parameters": {
+        "url": "https://yourcompany.zendesk.com/api/v2/search.json",
+        "method": "GET",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "={{ 'type:ticket organization_id:' + $json.zendesk_org_id + ' created>' + $now.minus({days: 30}).toISO().substring(0,10) }}"
+            },
+            {
+              "name": "per_page",
+              "value": "100"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 2,
+            "waitBetweenTries": 3000
+          },
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "step_7_check",
+      "name": "Gate \u2013 Zendesk Fetch Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2750,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.results !== undefined && $json.results !== null ? 'ok' : 'fail' }}",
+              "rightValue": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_8",
+      "name": "Parse Zendesk Support Health Signals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3000,
+        300
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nconst zdResults = item.results || (item.body && item.body.results) || null;\nconst nextPage = item.next_page || (item.body && item.body.next_page) || null;\nlet zendesk_signals = { available: false, ticket_count_30d: 0, escalated_count: 0, unresolved_count: 0, escalation_rate: 0, avg_resolution_hrs: 0, zendesk_zero_tickets: false, paginated_truncated: false };\ntry {\n  if (Array.isArray(zdResults)) {\n    const tickets = zdResults;\n    const escalated = tickets.filter(function(t){ return (t.tags || []).indexOf('escalated') >= 0 || t.priority === 'urgent'; });\n    const unresolved = tickets.filter(function(t){ return ['solved','closed'].indexOf(t.status) < 0; });\n    const resolved = tickets.filter(function(t){ return t.solved_at && t.created_at; });\n    const avgHrs = resolved.length ? resolved.reduce(function(sum, t){ return sum + (new Date(t.solved_at) - new Date(t.created_at)) / 3600000; }, 0) / resolved.length : 0;\n    zendesk_signals = { available: true, ticket_count_30d: tickets.length, escalated_count: escalated.length, unresolved_count: unresolved.length, escalation_rate: tickets.length ? Math.round(escalated.length / tickets.length * 100) : 0, avg_resolution_hrs: Math.round(avgHrs), zendesk_zero_tickets: tickets.length === 0, paginated_truncated: !!nextPage };\n  }\n} catch(e) {\n  zendesk_signals = { available: false, ticket_count_30d: 0, escalated_count: 0, unresolved_count: 0, escalation_rate: 0, avg_resolution_hrs: 0, zendesk_zero_tickets: false, paginated_truncated: false };\n}\nreturn [{ json: Object.assign({}, item, { zendesk_signals: zendesk_signals }) }];"
+      }
+    },
+    {
+      "id": "step_9_guard",
+      "name": "Check Stripe Customer ID Present",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3250,
+        300
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nconst hasStripe = typeof item.stripe_customer_id === 'string' && item.stripe_customer_id.trim().length > 0;\nreturn [{ json: Object.assign({}, item, { has_stripe_customer_id: hasStripe }) }];"
+      }
+    },
+    {
+      "id": "step_9_guard_gate",
+      "name": "Gate \u2013 Stripe Customer ID Present",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3500,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.has_stripe_customer_id }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_9",
+      "name": "Fetch Stripe Billing and Payment History",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3750,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.stripe.com/v1/subscriptions",
+        "method": "GET",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerTokenAuth",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "customer",
+              "value": "={{ $json.stripe_customer_id }}"
+            },
+            {
+              "name": "limit",
+              "value": "10"
+            },
+            {
+              "name": "expand[]",
+              "value": "data.latest_invoice.payment_intent"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          },
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "step_9_check",
+      "name": "Gate \u2013 Stripe Fetch Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4000,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.data !== undefined && $json.data !== null ? 'ok' : 'fail' }}",
+              "rightValue": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_10",
+      "name": "Parse Stripe Billing Risk Signals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4250,
+        300
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nconst stripeData = item.data || (item.body && item.body.data) || null;\nlet stripe_signals = { available: false, mrr: 0, mrr_source: 'unavailable', subscription_status: 'unknown', payment_failures_detected: 0, payment_failures_note: 'data unavailable', in_dunning: false, cancel_at_period_end: false };\ntry {\n  if (Array.isArray(stripeData) && stripeData.length) {\n    const sub = stripeData[0];\n    const inv = sub.latest_invoice || {};\n    const piFailure = inv.payment_intent && inv.payment_intent.last_payment_error ? 1 : 0;\n    const metaFailures = sub.metadata && sub.metadata.payment_failure_count ? parseInt(sub.metadata.payment_failure_count) : 0;\n    // MRR: prefer items.data[0].price.unit_amount (current API), fallback to deprecated plan.amount\n    let mrr = 0;\n    let mrrSource = 'unavailable';\n    if (sub.items && sub.items.data && sub.items.data[0] && sub.items.data[0].price && sub.items.data[0].price.unit_amount != null) {\n      mrr = Math.round(sub.items.data[0].price.unit_amount / 100);\n      mrrSource = 'items.price';\n    } else if (sub.plan && sub.plan.amount != null) {\n      mrr = Math.round(sub.plan.amount / 100);\n      mrrSource = 'plan_deprecated';\n    }\n    stripe_signals = { available: true, mrr: mrr, mrr_source: mrrSource, subscription_status: sub.status || 'unknown', payment_failures_detected: piFailure + metaFailures, payment_failures_note: 'proxy metric from latest invoice; not a full 90-day history', in_dunning: sub.status === 'past_due', cancel_at_period_end: sub.cancel_at_period_end || false };\n  }\n} catch(e) {\n  stripe_signals = { available: false, mrr: 0, mrr_source: 'unavailable', subscription_status: 'unknown', payment_failures_detected: 0, payment_failures_note: 'parse error', in_dunning: false, cancel_at_period_end: false };\n}\nreturn [{ json: Object.assign({}, item, { stripe_signals: stripe_signals }) }];"
+      }
+    },
+    {
+      "id": "step_11",
+      "name": "Validate Minimum Data Coverage (2-of-3 APIs)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4500,
+        300
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nconst amp = item.amplitude_signals && item.amplitude_signals.available === true;\nconst zd = item.zendesk_signals && item.zendesk_signals.available === true;\nconst stripe = item.stripe_signals && item.stripe_signals.available === true;\nconst sources_available = [amp, zd, stripe].filter(Boolean).length;\nconst has_minimum_data = sources_available >= 2;\nreturn [{ json: Object.assign({}, item, { sources_available: sources_available, has_minimum_data: has_minimum_data }) }];"
+      }
+    },
+    {
+      "id": "step_12",
+      "name": "Gate \u2013 Sufficient Data Coverage Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4750,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.has_minimum_data }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_14",
+      "name": "Assemble LLM Prompt with Account Signals",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        5000,
+        300
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "llm_prompt",
+              "value": "={{ 'You are a Customer Success analyst. Assess the health of the following B2B SaaS account and return a JSON object with exactly these fields: score (integer 0-100), headline (one sentence max 15 words summarizing health), suggestions (array of exactly 2-3 specific intervention strings tied to observed signals).\\n\\nAccount: ' + $json.account_name + ' (ID: ' + $json.account_id + ', Tier: ' + $json.tier + ')\\n\\nAmplitude Usage (30 days):\\n- DAU average: ' + $json.amplitude_signals.dau_avg + '\\n- DAU trend: ' + $json.amplitude_signals.dau_trend + '\\n- Session count: ' + $json.amplitude_signals.session_count_30d + '\\n- Data available: ' + $json.amplitude_signals.available + '\\n\\nZendesk Support (30 days, up to 100 tickets per page):\\n- Ticket count: ' + $json.zendesk_signals.ticket_count_30d + '\\n- Escalated tickets: ' + $json.zendesk_signals.escalated_count + '\\n- Unresolved tickets: ' + $json.zendesk_signals.unresolved_count + '\\n- Escalation rate: ' + $json.zendesk_signals.escalation_rate + '%\\n- Avg resolution: ' + $json.zendesk_signals.avg_resolution_hrs + ' hrs\\n- Data available: ' + $json.zendesk_signals.available + '\\n- Zero tickets flag (may indicate org mapping issue, not necessarily healthy): ' + $json.zendesk_signals.zendesk_zero_tickets + '\\n- Results truncated at 100 (more pages exist): ' + $json.zendesk_signals.paginated_truncated + '\\n\\nStripe Billing:\\n- MRR: $' + $json.stripe_signals.mrr + ' (source: ' + $json.stripe_signals.mrr_source + '; if unavailable, do not treat $0 as healthy signal)\\n- Status: ' + $json.stripe_signals.subscription_status + '\\n- Payment failures detected: ' + $json.stripe_signals.payment_failures_detected + ' (' + $json.stripe_signals.payment_failures_note + ')\\n- In dunning: ' + $json.stripe_signals.in_dunning + '\\n- Cancel at period end: ' + $json.stripe_signals.cancel_at_period_end + '\\n- Data available: ' + $json.stripe_signals.available + '\\n\\nScoring guidance: 0-39 = critical churn risk, 40-69 = at-risk needs intervention, 70-100 = healthy. Weight usage decline, escalations, and payment failures most heavily. When data is unavailable or uncertain (noted above), do not treat absence as a positive signal. Return ONLY valid JSON, no markdown, no explanation.' }}",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "account_id",
+              "value": "={{ $json.account_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "account_name",
+              "value": "={{ $json.account_name }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "csm_email",
+              "value": "={{ $json.csm_email }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "tier",
+              "value": "={{ $json.tier }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "amplitude_signals",
+              "value": "={{ $json.amplitude_signals }}",
+              "type": "object"
+            },
+            {
+              "id": "a6",
+              "name": "zendesk_signals",
+              "value": "={{ $json.zendesk_signals }}",
+              "type": "object"
+            },
+            {
+              "id": "a7",
+              "name": "stripe_signals",
+              "value": "={{ $json.stripe_signals }}",
+              "type": "object"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_15",
+      "name": "LLM Health Score and Intervention Assessment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5250,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerTokenAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "model": "gpt-4o",
+          "temperature": 0.2,
+          "response_format": {
+            "type": "json_object"
+          },
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a B2B SaaS Customer Success analyst. Always respond with valid JSON only. No markdown, no explanation."
+            },
+            {
+              "role": "user",
+              "content": "={{ $json.llm_prompt }}"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 2,
+            "waitBetweenTries": 5000
+          },
+          "timeout": 60000
+        }
+      }
+    },
+    {
+      "id": "step_15_check",
+      "name": "Gate \u2013 LLM HTTP Call Succeeded",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        5500,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ Array.isArray($json.choices) && $json.choices.length > 0 ? 'ok' : 'fail' }}",
+              "rightValue": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_16",
+      "name": "Parse and Validate LLM Health Score Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5750,
+        300
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nlet llm_valid = false;\nlet health_score = null;\nlet headline = '';\nlet suggestions = [];\ntry {\n  const content = item.choices && item.choices[0] && item.choices[0].message && item.choices[0].message.content ? item.choices[0].message.content : '{}';\n  const parsed = JSON.parse(content);\n  health_score = parseInt(parsed.score);\n  headline = parsed.headline || '';\n  suggestions = Array.isArray(parsed.suggestions) ? parsed.suggestions : [];\n  llm_valid = Number.isInteger(health_score) && health_score >= 0 && health_score <= 100 && headline.length > 0 && suggestions.length >= 2 && suggestions.length <= 3;\n} catch(e) {\n  llm_valid = false;\n}\nconst severity = health_score !== null && Number.isInteger(health_score) ? (health_score <= 39 ? 'critical' : health_score <= 69 ? 'at_risk' : 'healthy') : 'unknown';\nreturn [{ json: { account_id: item.account_id, account_name: item.account_name, csm_email: item.csm_email, tier: item.tier, amplitude_signals: item.amplitude_signals, zendesk_signals: item.zendesk_signals, stripe_signals: item.stripe_signals, health_score: health_score, headline: headline, suggestions: suggestions, severity: severity, llm_valid: llm_valid } }];"
+      }
+    },
+    {
+      "id": "step_17",
+      "name": "Gate \u2013 LLM Response Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        6000,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.llm_valid }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_19",
+      "name": "Determine Severity Bucket and Alert Flags",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6250,
+        300
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nconst score = item.health_score;\nconst is_critical = score <= 39;\nconst is_at_risk = score >= 40 && score <= 69;\nconst is_healthy = score >= 70;\nconst should_alert = is_critical || is_at_risk;\nreturn [{ json: Object.assign({}, item, { is_critical: is_critical, is_at_risk: is_at_risk, is_healthy: is_healthy, should_alert: should_alert }) }];"
+      }
+    },
+    {
+      "id": "step_19b",
+      "name": "Check Alert Cooldown \u2013 Deduplication",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6500,
+        300
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nconst staticData = $workflow.staticData;\nif (!staticData.alertLog) staticData.alertLog = {};\nconst now = Date.now();\nconst accountKey = item.account_id;\nconst lastAlerted = staticData.alertLog[accountKey] ? staticData.alertLog[accountKey].last_alerted : 0;\nconst cooldownMs = item.is_critical ? 24 * 60 * 60 * 1000 : 48 * 60 * 60 * 1000;\nconst withinCooldown = (now - lastAlerted) < cooldownMs;\nlet cooldown_suppressed = false;\nif (item.should_alert) {\n  if (withinCooldown) {\n    cooldown_suppressed = true;\n  } else {\n    // Update last_alerted for this account\n    staticData.alertLog[accountKey] = { last_alerted: now, severity: item.severity };\n  }\n}\nreturn [{ json: Object.assign({}, item, { cooldown_suppressed: cooldown_suppressed, last_alerted_ts: lastAlerted }) }];"
+      }
+    },
+    {
+      "id": "step_19c",
+      "name": "Gate \u2013 Cooldown Suppressed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        6750,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.cooldown_suppressed }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_19d",
+      "name": "Log Cooldown Suppressed Alert",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        7000,
+        300
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "alert_status",
+              "value": "suppressed_cooldown",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "account_id",
+              "value": "={{ $json.account_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "health_score",
+              "value": "={{ $json.health_score }}",
+              "type": "number"
+            },
+            {
+              "id": "a3",
+              "name": "severity",
+              "value": "={{ $json.severity }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "last_alerted_ts",
+              "value": "={{ $json.last_alerted_ts }}",
+              "type": "number"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_22",
+      "name": "Gate \u2013 Critical vs At-Risk Routing",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        7250,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.is_critical }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_23",
+      "name": "Post Critical Alert to #cs-critical Slack Channel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7500,
+        300
+      ],
+      "parameters": {
+        "url": "https://hooks.slack.com/services/CRITICAL_WEBHOOK_PATH",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "channel": "#cs-critical",
+          "username": "HealthScoreBot",
+          "icon_emoji": ":rotating_light:",
+          "text": "={{ ':rotating_light: *CRITICAL HEALTH ALERT* \u2013 ' + $json.account_name + ' (Score: ' + $json.health_score + '/100)\\n*' + $json.headline + '*\\n\\n*Suggested Interventions:*\\n\u2022 ' + ($json.suggestions || []).join('\\n\u2022 ') + '\\n\\nCSM: ' + $json.csm_email + ' | Tier: ' + $json.tier }}"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_24",
+      "name": "Send Critical Alert Email to CSM and VP via SendGrid",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7750,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.sendgrid.com/v3/mail/send",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerTokenAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "from": {
+            "email": "cs-alerts@yourcompany.com",
+            "name": "CS Health Alerts"
+          },
+          "template_id": "d-critical-health",
+          "personalizations": [
+            {
+              "to": "={{ [{ email: $json.csm_email }, { email: 'cs-vp@yourcompany.com' }] }}",
+              "dynamic_template_data": {
+                "account_name": "={{ $json.account_name }}",
+                "health_score": "={{ $json.health_score }}",
+                "headline": "={{ $json.headline }}",
+                "suggestions": "={{ $json.suggestions }}",
+                "severity": "critical",
+                "tier": "={{ $json.tier }}",
+                "amplitude_dau_trend": "={{ $json.amplitude_signals.dau_trend }}",
+                "zendesk_escalations": "={{ $json.zendesk_signals.escalated_count }}",
+                "stripe_status": "={{ $json.stripe_signals.subscription_status }}"
+              }
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_25",
+      "name": "Mark Critical Account Alerts Sent",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        8000,
+        300
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "alert_status",
+              "value": "critical_alerts_sent",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "account_id",
+              "value": "={{ $json.account_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "health_score",
+              "value": "={{ $json.health_score }}",
+              "type": "number"
+            },
+            {
+              "id": "a3",
+              "name": "severity",
+              "value": "critical",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_27",
+      "name": "Send At-Risk Alert Email to CSM Only via SendGrid",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        8250,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.sendgrid.com/v3/mail/send",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerTokenAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "from": {
+            "email": "cs-alerts@yourcompany.com",
+            "name": "CS Health Alerts"
+          },
+          "template_id": "d-at-risk-health",
+          "personalizations": [
+            {
+              "to": "={{ [{ email: $json.csm_email }] }}",
+              "dynamic_template_data": {
+                "account_name": "={{ $json.account_name }}",
+                "health_score": "={{ $json.health_score }}",
+                "headline": "={{ $json.headline }}",
+                "suggestions": "={{ $json.suggestions }}",
+                "severity": "at_risk",
+                "tier": "={{ $json.tier }}",
+                "amplitude_dau_trend": "={{ $json.amplitude_signals.dau_trend }}",
+                "zendesk_escalations": "={{ $json.zendesk_signals.escalated_count }}",
+                "stripe_status": "={{ $json.stripe_signals.subscription_status }}"
+              }
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_28",
+      "name": "Mark At-Risk Account Alerts Sent",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        8500,
+        300
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "alert_status",
+              "value": "at_risk_alerts_sent",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "account_id",
+              "value": "={{ $json.account_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "health_score",
+              "value": "={{ $json.health_score }}",
+              "type": "number"
+            },
+            {
+              "id": "a3",
+              "name": "severity",
+              "value": "at_risk",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_29",
+      "name": "PagerDuty Failure Alert Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        8750,
+        300
+      ],
+      "parameters": {
+        "url": "https://events.pagerduty.com/v2/enqueue",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "routing_key": "PAGERDUTY_INTEGRATION_KEY_PLACEHOLDER",
+          "event_action": "trigger",
+          "payload": {
+            "summary": "Customer Health Score Pipeline FAILED \u2013 churn alerts may not have sent",
+            "severity": "critical",
+            "source": "n8n-health-score-pipeline",
+            "custom_details": {
+              "workflow": "Customer Health Score and Churn Risk Alert Pipeline"
+            }
+          }
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      }
+    },
+    {
+      "id": "step_5_fail",
+      "name": "Inject Degraded Amplitude Signals on Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1750,
+        450
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nreturn [{ json: Object.assign({}, item, { amplitude_signals: { available: false, dau_avg: 0, dau_trend: 'unknown', session_count_30d: 0, _degraded_reason: 'api_failure' } }) }];"
+      }
+    },
+    {
+      "id": "step_7_fail",
+      "name": "Inject Degraded Zendesk Signals on Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2500,
+        450
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nreturn [{ json: Object.assign({}, item, { zendesk_signals: { available: false, ticket_count_30d: 0, escalated_count: 0, unresolved_count: 0, escalation_rate: 0, avg_resolution_hrs: 0, paginated_truncated: false } }) }];"
+      }
+    },
+    {
+      "id": "step_9_fail",
+      "name": "Inject Degraded Stripe Signals on Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3750,
+        450
+      ],
+      "parameters": {
+        "continueOnFail": true,
+        "jsCode": "const item = $input.first().json;\nreturn [{ json: Object.assign({}, item, { stripe_signals: { available: false, mrr: 0, mrr_source: 'unavailable', subscription_status: 'unknown', payment_failures_detected: 0, payment_failures_note: 'data unavailable', in_dunning: false, cancel_at_period_end: false } }) }];"
+      }
+    },
+    {
+      "id": "step_13",
+      "name": "Log Skipped Account \u2013 Insufficient Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4500,
+        450
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "skip_reason",
+              "value": "insufficient_data_coverage",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "account_id",
+              "value": "={{ $json.account_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "sources_available",
+              "value": "={{ $json.sources_available }}",
+              "type": "number"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_18",
+      "name": "Log Invalid LLM Response \u2013 Account Skipped",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        5750,
+        450
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "skip_reason",
+              "value": "llm_response_invalid",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "account_id",
+              "value": "={{ $json.account_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "account_name",
+              "value": "={{ $json.account_name }}",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_20",
+      "name": "Gate \u2013 Should Alert (Suppress Healthy)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        6500,
+        450
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.should_alert }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "step_21",
+      "name": "Suppress Healthy Account \u2013 No Alert",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        6250,
+        450
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "alert_status",
+              "value": "suppressed_healthy",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "account_id",
+              "value": "={{ $json.account_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "health_score",
+              "value": "={{ $json.health_score }}",
+              "type": "number"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_26",
+      "name": "Post At-Risk Alert to #cs-at-risk Slack Channel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7250,
+        450
+      ],
+      "parameters": {
+        "url": "https://hooks.slack.com/services/AT_RISK_WEBHOOK_PATH",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "channel": "#cs-at-risk",
+          "username": "HealthScoreBot",
+          "icon_emoji": ":warning:",
+          "text": "={{ ':warning: *AT-RISK HEALTH ALERT* \u2013 ' + $json.account_name + ' (Score: ' + $json.health_score + '/100)\\n*' + $json.headline + '*\\n\\n*Suggested Interventions:*\\n\u2022 ' + ($json.suggestions || []).join('\\n\u2022 ') + '\\n\\nCSM: ' + $json.csm_email + ' | Tier: ' + $json.tier }}"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Runs Monday-Friday at 6:00 AM Pacific (14:00 UTC)": {
+      "main": [
+        [
+          {
+            "node": "Schedule Trigger \u2013 Weekdays 6am Pacific",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger \u2013 Weekdays 6am Pacific": {
+      "main": [
+        [
+          {
+            "node": "Fetch Account List from CSM Directory API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Account List from CSM Directory API": {
+      "main": [
+        [
+          {
+            "node": "Split Accounts Into Individual Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Accounts Into Individual Items": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Accounts One at a Time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Accounts One at a Time": {
+      "main": [
+        [
+          {
+            "node": "Rate-Limit Pacing Delay Between Accounts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate-Limit Pacing Delay Between Accounts": {
+      "main": [
+        [
+          {
+            "node": "Fetch Amplitude 30-Day Usage Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Amplitude 30-Day Usage Metrics": {
+      "main": [
+        [
+          {
+            "node": "Parse Amplitude Usage Signals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Inject Degraded Amplitude Signals on Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate \u2013 Amplitude Fetch Success": {
+      "main": [
+        [
+          {
+            "node": "Gate \u2013 Zendesk Fetch Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inject Degraded Amplitude Signals on Failure": {
+      "main": [
+        [
+          {
+            "node": "Fetch Zendesk 30-Day Support Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Amplitude Usage Signals": {
+      "main": [
+        [
+          {
+            "node": "Fetch Zendesk 30-Day Support Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Zendesk 30-Day Support Tickets": {
+      "main": [
+        [
+          {
+            "node": "Parse Zendesk Support Health Signals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Inject Degraded Zendesk Signals on Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate \u2013 Zendesk Fetch Success": {
+      "main": [
+        [
+          {
+            "node": "Gate \u2013 Stripe Customer ID Present",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inject Degraded Zendesk Signals on Failure": {
+      "main": [
+        [
+          {
+            "node": "Check Stripe Customer ID Present",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Zendesk Support Health Signals": {
+      "main": [
+        [
+          {
+            "node": "Check Stripe Customer ID Present",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Stripe Customer ID Present": {
+      "main": [
+        [
+          {
+            "node": "Fetch Stripe Billing and Payment History",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Inject Degraded Stripe Signals on Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate \u2013 Stripe Customer ID Present": {
+      "main": [
+        [
+          {
+            "node": "Gate \u2013 Stripe Fetch Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Stripe Billing and Payment History": {
+      "main": [
+        [
+          {
+            "node": "Parse Stripe Billing Risk Signals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Inject Degraded Stripe Signals on Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate \u2013 Stripe Fetch Success": {
+      "main": [
+        [
+          {
+            "node": "Gate \u2013 Sufficient Data Coverage Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inject Degraded Stripe Signals on Failure": {
+      "main": [
+        [
+          {
+            "node": "Validate Minimum Data Coverage (2-of-3 APIs)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Stripe Billing Risk Signals": {
+      "main": [
+        [
+          {
+            "node": "Validate Minimum Data Coverage (2-of-3 APIs)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Minimum Data Coverage (2-of-3 APIs)": {
+      "main": [
+        [
+          {
+            "node": "Assemble LLM Prompt with Account Signals",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Skipped Account \u2013 Insufficient Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate \u2013 Sufficient Data Coverage Check": {
+      "main": [
+        [
+          {
+            "node": "LLM Health Score and Intervention Assessment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Skipped Account \u2013 Insufficient Data": {
+      "main": [
+        [
+          {
+            "node": "LLM Health Score and Intervention Assessment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble LLM Prompt with Account Signals": {
+      "main": [
+        [
+          {
+            "node": "LLM Health Score and Intervention Assessment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Health Score and Intervention Assessment": {
+      "main": [
+        [
+          {
+            "node": "Parse and Validate LLM Health Score Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Invalid LLM Response \u2013 Account Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate \u2013 LLM HTTP Call Succeeded": {
+      "main": [
+        [
+          {
+            "node": "Gate \u2013 LLM Response Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and Validate LLM Health Score Response": {
+      "main": [
+        [
+          {
+            "node": "Determine Severity Bucket and Alert Flags",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Invalid LLM Response \u2013 Account Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate \u2013 LLM Response Valid": {
+      "main": [
+        [
+          {
+            "node": "Gate \u2013 Cooldown Suppressed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Invalid LLM Response \u2013 Account Skipped": {
+      "main": [
+        [
+          {
+            "node": "Gate \u2013 Cooldown Suppressed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Determine Severity Bucket and Alert Flags": {
+      "main": [
+        [
+          {
+            "node": "Check Alert Cooldown \u2013 Deduplication",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Alert Cooldown \u2013 Deduplication": {
+      "main": [
+        [
+          {
+            "node": "Log Cooldown Suppressed Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gate \u2013 Should Alert (Suppress Healthy)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate \u2013 Cooldown Suppressed": {
+      "main": [
+        [
+          {
+            "node": "PagerDuty Failure Alert Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Cooldown Suppressed Alert": {
+      "main": [
+        [
+          {
+            "node": "PagerDuty Failure Alert Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate \u2013 Should Alert (Suppress Healthy)": {
+      "main": [
+        [
+          {
+            "node": "PagerDuty Failure Alert Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Suppress Healthy Account \u2013 No Alert": {
+      "main": [
+        [
+          {
+            "node": "PagerDuty Failure Alert Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate \u2013 Critical vs At-Risk Routing": {
+      "main": [
+        [
+          {
+            "node": "Post Critical Alert to #cs-critical Slack Channel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Post At-Risk Alert to #cs-at-risk Slack Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Critical Alert to #cs-critical Slack Channel": {
+      "main": [
+        [
+          {
+            "node": "Send Critical Alert Email to CSM and VP via SendGrid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Critical Alert Email to CSM and VP via SendGrid": {
+      "main": [
+        [
+          {
+            "node": "Mark Critical Account Alerts Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Critical Account Alerts Sent": {
+      "main": [
+        [
+          {
+            "node": "PagerDuty Failure Alert Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post At-Risk Alert to #cs-at-risk Slack Channel": {
+      "main": [
+        [
+          {
+            "node": "Send At-Risk Alert Email to CSM Only via SendGrid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send At-Risk Alert Email to CSM Only via SendGrid": {
+      "main": [
+        [
+          {
+            "node": "Mark At-Risk Account Alerts Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark At-Risk Account Alerts Sent": {
+      "main": [
+        [
+          {
+            "node": "PagerDuty Failure Alert Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 7200,
+    "saveExecutionProgress": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  }
+}

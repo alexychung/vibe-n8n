@@ -1,0 +1,256 @@
+{
+  "name": "Echo Validation Webhook",
+  "nodes": [
+    {
+      "id": "trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        250,
+        300
+      ],
+      "parameters": {
+        "path": "echo-test",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "authentication": "headerAuth"
+      },
+      "webhookId": "echo-test-id",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "LkxrdpSl4lGH5jEF",
+          "name": "Echo Validation Webhook \u2014 Webhook Trigger auth"
+        }
+      }
+    },
+    {
+      "id": "step_1",
+      "name": "Validate Input Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const body = $json.body;\n\nif (body === undefined || body === null) {\n  return [{ json: { isValid: false, errorMessage: 'Request body is missing or could not be parsed. Ensure Content-Type: application/json is set.', name: null, value: null } }];\n}\n\nif (typeof body !== 'object' || Array.isArray(body)) {\n  return [{ json: { isValid: false, errorMessage: 'Request body is missing or could not be parsed. Ensure Content-Type: application/json is set.', name: null, value: null } }];\n}\n\nconst name = body.name;\nconst value = body.value;\n\nlet isValid = true;\nlet errorMessage = '';\n\nif (typeof name !== 'string' || name.trim() === '') {\n  isValid = false;\n  errorMessage = 'Invalid input: name must be a non-empty string';\n} else if (value === undefined || value === null || typeof value !== 'number') {\n  isValid = false;\n  errorMessage = 'Invalid input: value is required and must be a number';\n} else if (isNaN(value)) {\n  isValid = false;\n  errorMessage = 'Invalid input: value must be a valid number';\n} else if (!Number.isInteger(value)) {\n  isValid = false;\n  errorMessage = 'Invalid input: value must be an integer';\n} else if (value < 0 || value > 100) {\n  isValid = false;\n  errorMessage = 'Invalid input: value must be between 0 and 100 inclusive';\n}\n\nreturn [{ json: { isValid, errorMessage, name, value } }];"
+      }
+    },
+    {
+      "id": "step_2",
+      "name": "Branch on Validation Result",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        750,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "leftValue": "",
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond_0",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "leftValue": "={{ $json.isValid }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_3",
+      "name": "Build Success Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1000,
+        300
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "status",
+              "type": "string",
+              "value": "ok"
+            },
+            {
+              "id": "a1",
+              "name": "name",
+              "type": "string",
+              "value": "={{ $json.name }}"
+            },
+            {
+              "id": "a2",
+              "name": "value",
+              "type": "number",
+              "value": "={{ $json.value }}"
+            },
+            {
+              "id": "a3",
+              "name": "timestamp",
+              "type": "string",
+              "value": "={{ new Date().toISOString() }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "step_4",
+      "name": "Respond with Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1250,
+        300
+      ],
+      "parameters": {
+        "options": {
+          "responseCode": 200
+        },
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "authentication": "headerAuth"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "wlyqncaywNemliSL",
+          "name": "Echo Validation Webhook \u2014 Respond with Success auth"
+        }
+      }
+    },
+    {
+      "id": "step_6",
+      "name": "Respond with Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1500,
+        300
+      ],
+      "parameters": {
+        "options": {
+          "responseCode": 200
+        },
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "authentication": "headerAuth"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "0IAuakrdhtAdGly6",
+          "name": "Echo Validation Webhook \u2014 Respond with Error auth"
+        }
+      }
+    },
+    {
+      "id": "step_5",
+      "name": "Build Error Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        750,
+        450
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "status",
+              "type": "string",
+              "value": "error"
+            },
+            {
+              "id": "a1",
+              "name": "message",
+              "type": "string",
+              "value": "={{ $json.errorMessage || 'Invalid input' }}"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Validate Input Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input Fields": {
+      "main": [
+        [
+          {
+            "node": "Branch on Validation Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Branch on Validation Result": {
+      "main": [
+        [
+          {
+            "node": "Build Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Success Response": {
+      "main": [
+        [
+          {
+            "node": "Respond with Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Error Response": {
+      "main": [
+        [
+          {
+            "node": "Respond with Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 10,
+    "saveExecutionProgress": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  }
+}
