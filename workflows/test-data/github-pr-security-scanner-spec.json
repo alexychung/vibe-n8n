@@ -1,0 +1,922 @@
+{
+  "workflow_name": "GitHub PR Security Scanner",
+  "description": "Automatically scans GitHub pull request diffs with an LLM to detect security risks and posts non-blocking findings as comments, requesting security team review only for high-risk PRs.",
+  "trigger": {
+    "type": "webhook",
+    "path": "github-pr-security-scan",
+    "method": "POST",
+    "description": "Receives GitHub pull_request webhook events for 'opened' and 'synchronize' actions"
+  },
+  "steps": [
+    {
+      "id": "step_2b",
+      "name": "Respond to Webhook",
+      "node_type": "n8n-nodes-base.respondToWebhook",
+      "determinism": "1.0",
+      "description": "Immediately returns HTTP 200 to GitHub so the webhook is acknowledged within 2 seconds before any heavy processing (LLM calls, GitHub API calls) begins. Placed first so GitHub receives ACK regardless of downstream failures.",
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\": \"accepted\"}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "output_shape": {},
+      "error_handling": "Best-effort \u2014 if this fails, continue processing anyway"
+    },
+    {
+      "id": "step_1",
+      "name": "Acknowledge Webhook Immediately",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Extracts and sets key PR fields from the webhook payload for use downstream",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "status",
+              "value": "accepted",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "pr_number",
+              "value": "={{ $json.body.pull_request.number }}",
+              "type": "number"
+            },
+            {
+              "id": "a2",
+              "name": "repo_full_name",
+              "value": "={{ $json.body.repository.full_name }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "action",
+              "value": "={{ $json.body.action }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "head_sha",
+              "value": "={{ $json.body.pull_request.head.sha }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "pr_title",
+              "value": "={{ $json.body.pull_request.title }}",
+              "type": "string"
+            },
+            {
+              "id": "a6",
+              "name": "pr_html_url",
+              "value": "={{ $json.body.pull_request.html_url }}",
+              "type": "string"
+            },
+            {
+              "id": "a7",
+              "name": "base_repo",
+              "value": "={{ $json.body.repository.full_name }}",
+              "type": "string"
+            },
+            {
+              "id": "a8",
+              "name": "installation_id",
+              "value": "={{ $json.body.installation.id }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "status": "string",
+        "pr_number": "number",
+        "repo_full_name": "string",
+        "action": "string",
+        "head_sha": "string",
+        "pr_title": "string",
+        "pr_html_url": "string",
+        "base_repo": "string",
+        "installation_id": "string"
+      },
+      "error_handling": "On failure, log and continue"
+    },
+    {
+      "id": "step_2",
+      "name": "Validate PR Event Fields",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Validates that the webhook payload contains required fields (action, pr_number, repo, sha) and that the action is 'opened' or 'synchronize'. Outputs a boolean valid flag.",
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst validActions = ['opened', 'synchronize'];\nconst action = item.action || '';\nconst prNumber = item.pr_number;\nconst repoFullName = item.repo_full_name || '';\nconst headSha = item.head_sha || '';\n\nconst isValid = (\n  validActions.includes(action) &&\n  prNumber != null && prNumber > 0 &&\n  repoFullName.includes('/') &&\n  headSha.length > 0\n);\n\nreturn [{\n  json: {\n    ...item,\n    is_valid_event: isValid,\n    validation_reason: !isValid ? `Invalid: action=${action}, pr=${prNumber}, repo=${repoFullName}, sha=${headSha}` : 'ok'\n  }\n}];"
+      },
+      "output_shape": {
+        "is_valid_event": "boolean",
+        "validation_reason": "string",
+        "pr_number": "number",
+        "repo_full_name": "string",
+        "action": "string",
+        "head_sha": "string",
+        "pr_title": "string",
+        "pr_html_url": "string"
+      },
+      "error_handling": "On code error, set is_valid_event=false and route to silent exit"
+    },
+    {
+      "id": "step_3",
+      "name": "Check Event Is Valid",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes to fetch PR files if event is valid; otherwise silently exits without posting any comment",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.is_valid_event }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {},
+      "error_handling": "False branch exits workflow silently"
+    },
+    {
+      "id": "step_4",
+      "name": "Fetch PR Changed Files",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Fetches the list of changed files with patches (diffs) from the GitHub API for the pull request. Response format is set to JSON with splitIntoItems disabled so the full array lands in a single item.",
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $('Validate PR Event Fields').first().json.repo_full_name }}/pulls/{{ $('Validate PR Event Fields').first().json.pr_number }}/files",
+        "method": "GET",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "per_page",
+              "value": "100"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": false
+            }
+          },
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "output_shape": {
+        "body": "array of file objects with filename, status, additions, deletions, patch fields"
+      },
+      "error_handling": "On HTTP error after retries, route to Slack error alert; do not post GitHub comment"
+    },
+    {
+      "id": "step_5",
+      "name": "Prepare Diff and Metadata for LLM",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Aggregates file diffs into a compact prompt payload for the LLM. Collects all items from step_4. Truncates individual file patches to 400 lines and total diff to 8000 chars. Warns if file count hits 100 (pagination limit). Retrieves PR metadata from the named Validate PR Event Fields node.",
+      "parameters": {
+        "jsCode": "// GitHub API returns an array; n8n httpRequest splits array responses into multiple items.\n// Collect all file objects from step_4 output items.\nconst filesRaw = $input.all().map(i => i.json);\n\n// Retrieve PR metadata from upstream named node (not from step_4's file items)\nconst meta = $('Validate PR Event Fields').first().json;\n\nconst MAX_PATCH_LINES = 400;\nconst MAX_TOTAL_CHARS = 8000;\n\nlet diffSections = [];\nlet totalChars = 0;\n\nfor (const file of filesRaw) {\n  const filename = file.filename || 'unknown';\n  const status = file.status || '';\n  let patch = file.patch || '';\n  \n  // Truncate per-file patch\n  const lines = patch.split('\\n');\n  if (lines.length > MAX_PATCH_LINES) {\n    patch = lines.slice(0, MAX_PATCH_LINES).join('\\n') + '\\n[...truncated]';\n  }\n  \n  const section = `### File: ${filename} (${status})\\n${patch}`;\n  \n  if (totalChars + section.length > MAX_TOTAL_CHARS) {\n    diffSections.push(`### File: ${filename} (${status})\\n[diff omitted \u2014 total size limit reached]`);\n    break;\n  }\n  \n  diffSections.push(section);\n  totalChars += section.length;\n}\n\nconst fileCount = filesRaw.length;\nconst fileNames = filesRaw.map(f => f.filename).filter(Boolean).join(', ');\n\n// Warn if we hit the pagination limit \u2014 some files may be missing\nlet paginationWarning = '';\nif (fileCount >= 100) {\n  paginationWarning = '\\n\\n> \u26a0\ufe0f **Note:** This PR has 100+ changed files. The scan may be incomplete due to GitHub API pagination limits. Only the first 100 files were analyzed.';\n  diffSections.push('\\n### \u26a0\ufe0f Pagination Warning\\n[This PR has 100+ files. Results may be incomplete \u2014 only first 100 files were fetched from GitHub API.]');\n}\n\nconst diffText = diffSections.join('\\n\\n');\n\nreturn [{\n  json: {\n    repo_full_name: meta.repo_full_name,\n    pr_number: meta.pr_number,\n    pr_title: meta.pr_title,\n    pr_html_url: meta.pr_html_url,\n    head_sha: meta.head_sha,\n    file_count: fileCount,\n    file_names: fileNames,\n    diff_text: diffText,\n    diff_char_count: diffText.length,\n    pagination_warning: paginationWarning\n  }\n}];"
+      },
+      "output_shape": {
+        "repo_full_name": "string",
+        "pr_number": "number",
+        "pr_title": "string",
+        "pr_html_url": "string",
+        "head_sha": "string",
+        "file_count": "number",
+        "file_names": "string",
+        "diff_text": "string",
+        "diff_char_count": "number",
+        "pagination_warning": "string"
+      },
+      "error_handling": "On failure, log error internally and route to Slack alert \u2014 do not post GitHub comment"
+    },
+    {
+      "id": "step_6",
+      "name": "Analyze Diff With LLM Security Prompt",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "3.0",
+      "description": "Sends the aggregated diff and PR metadata to the LLM (Claude) with a structured security analysis prompt. Uses raw body mode so 'messages' is a proper JSON array, not a stringified value.",
+      "parameters": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "method": "POST",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "body": "={{ JSON.stringify({ model: 'claude-3-5-haiku-20241022', max_tokens: 1024, system: 'You are a strict security code reviewer. Analyze the provided pull request diff for security risks. Be precise and conservative \u2014 only flag issues you are highly confident (>80%) are genuine security concerns. Do NOT flag normal code patterns. Respond ONLY with a valid JSON object matching this exact schema: {\"risk_level\": \"none|low|medium|high\", \"findings\": [{\"category\": \"hardcoded_secret|risky_dependency|auth_authz_change|sql_injection|dangerous_function|other\", \"severity\": \"low|medium|high\", \"file\": \"filename\", \"line_hint\": \"approximate line or diff hunk\", \"description\": \"concise one-sentence description\", \"confidence\": \"low|medium|high\"}], \"summary\": \"one sentence overall summary\", \"false_positive_risk\": \"low|medium|high\"}. If no findings, return risk_level none with empty findings array.', messages: [{ role: 'user', content: 'PR Title: ' + $json.pr_title + '\\nRepository: ' + $json.repo_full_name + '\\nFiles changed (' + $json.file_count + '): ' + $json.file_names + '\\n\\nDiff:\\n' + $json.diff_text + '\\n\\nAnalyze this PR diff for security risks. Return JSON only.' }] }) }}",
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 2,
+            "waitBetweenTries": 3000
+          }
+        }
+      },
+      "output_shape": {
+        "content": "array with text field containing JSON risk report",
+        "usage": "token usage object"
+      },
+      "error_handling": "On LLM API failure after retries, route to Slack error alert; do not post GitHub comment"
+    },
+    {
+      "id": "step_6b",
+      "name": "Check LLM Response Is Valid",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Validates that the LLM returned a non-empty text response. Sets llm_response_valid boolean flag. Also passes through the LLM content for use downstream.",
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst content = item.content || [];\nconst textBlock = content.find(c => c.type === 'text');\nconst llmText = (textBlock && textBlock.text) ? textBlock.text.trim() : '';\nconst isValid = llmText.length > 0;\n\nreturn [{\n  json: {\n    llm_response_valid: isValid,\n    llm_text: llmText,\n    llm_raw: item\n  }\n}];"
+      },
+      "output_shape": {
+        "llm_response_valid": "boolean",
+        "llm_text": "string",
+        "llm_raw": "object"
+      },
+      "error_handling": "On failure set llm_response_valid=false and route to error Slack alert"
+    },
+    {
+      "id": "step_6c",
+      "name": "Gate LLM Response Valid",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes to parse LLM report if response is valid; routes to Slack error alert otherwise",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.llm_response_valid }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {},
+      "error_handling": "False branch routes to Slack infrastructure error alert"
+    },
+    {
+      "id": "step_7",
+      "name": "Parse LLM Security Report",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Parses the LLM JSON response into a structured security report. Retrieves PR metadata from the named Prepare Diff node. Validates schema, sets risk level, findings count, and whether to escalate. On parse failure, routes to infrastructure error rather than silently defaulting to risk_level=none.",
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\n\n// LLM text is already extracted by step_6b\nconst llmText = item.llm_text || '';\n\n// Retrieve PR metadata from the upstream named node\nconst meta = $('Prepare Diff and Metadata for LLM').first().json;\n\n// Parse JSON from LLM output \u2014 try full text first, then regex extraction\nlet report = null;\nlet parseError = null;\ntry {\n  // First attempt: try to parse the entire trimmed text as JSON\n  let toParse = llmText.trim();\n  try {\n    report = JSON.parse(toParse);\n  } catch (e1) {\n    // Second attempt: extract JSON object using non-greedy-friendly approach\n    // Find first '{' and last '}' to extract outermost object\n    const firstBrace = toParse.indexOf('{');\n    const lastBrace = toParse.lastIndexOf('}');\n    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {\n      const candidate = toParse.slice(firstBrace, lastBrace + 1);\n      report = JSON.parse(candidate);\n    } else {\n      throw new Error('No JSON object found in LLM response');\n    }\n  }\n} catch(e) {\n  parseError = e.message;\n}\n\n// If parse failed, signal infrastructure error \u2014 do NOT silently default to 'none'\nif (!report || typeof report !== 'object') {\n  return [{\n    json: {\n      repo_full_name: meta.repo_full_name || 'unknown',\n      pr_number: meta.pr_number,\n      pr_title: meta.pr_title || '',\n      pr_html_url: meta.pr_html_url || '',\n      head_sha: meta.head_sha || 'unknown',\n      risk_level: 'parse_error',\n      findings_count: 0,\n      high_severity_count: 0,\n      summary: 'Could not parse LLM response',\n      false_positive_risk: 'unknown',\n      should_escalate: false,\n      should_comment: false,\n      comment_body: '',\n      parse_error: parseError,\n      parse_failed: true\n    }\n  }];\n}\n\n// Validate and normalize\nconst validRiskLevels = ['none', 'low', 'medium', 'high'];\nconst riskLevel = validRiskLevels.includes(report.risk_level) ? report.risk_level : 'none';\nconst findings = Array.isArray(report.findings) ? report.findings : [];\nconst summary = typeof report.summary === 'string' ? report.summary : 'No summary provided';\nconst fpRisk = report.false_positive_risk || 'medium';\n\n// High confidence findings only (filter out low confidence)\nconst highConfidenceFindings = findings.filter(f => f.confidence === 'high' || f.confidence === 'medium');\nconst highSeverityFindings = highConfidenceFindings.filter(f => f.severity === 'high');\n\n// Escalate if risk level is high AND there are high-severity high/medium-confidence findings\nconst shouldEscalate = riskLevel === 'high' && highSeverityFindings.length > 0;\n\n// Should post comment if any findings exist (non-none risk) OR if there are medium+ findings\nconst shouldComment = riskLevel !== 'none' && highConfidenceFindings.length > 0;\n\n// Use PR metadata from named node reference\nconst repoFullName = meta.repo_full_name || 'unknown';\nconst prNumber = meta.pr_number;\nconst prTitle = meta.pr_title || '';\nconst prHtmlUrl = meta.pr_html_url || '';\nconst headSha = meta.head_sha || 'unknown';\nconst paginationWarning = meta.pagination_warning || '';\n\n// Format findings as GitHub markdown comment\nlet commentBody = '';\nif (shouldComment) {\n  const findingLines = highConfidenceFindings.map(f => {\n    const sev = f.severity === 'high' ? '\ud83d\udd34' : f.severity === 'medium' ? '\ud83d\udfe1' : '\ud83d\udfe2';\n    return `| ${sev} ${f.severity.toUpperCase()} | ${f.category} | \\`${f.file}\\` | ${f.description} |`;\n  }).join('\\n');\n\n  commentBody = `## \ud83d\udd12 Security Scan Results\\n\\n**Risk Level:** \\`${riskLevel.toUpperCase()}\\`  \\n**Summary:** ${summary}\\n\\n> \u26a0\ufe0f This is an automated security pre-scan. It is non-blocking and for informational purposes only. All findings require human review.\\n\\n### Findings (${highConfidenceFindings.length} medium/high-confidence)\\n\\n| Severity | Category | File | Description |\\n|---|---|---|---|\\n${findingLines}\\n\\n*Scan performed on commit \\`${headSha}\\` | False positive risk: ${fpRisk}*${paginationWarning}`;\n} else {\n  commentBody = `## \ud83d\udd12 Security Scan Results\\n\\n**Risk Level:** \\`${riskLevel.toUpperCase()}\\`  \\n**Summary:** ${summary}\\n\\n\u2705 No medium/high-confidence security findings detected in this PR.\\n\\n*Scan performed on commit \\`${headSha}\\`*${paginationWarning}`;\n}\n\nreturn [{\n  json: {\n    repo_full_name: repoFullName,\n    pr_number: prNumber,\n    pr_title: prTitle,\n    pr_html_url: prHtmlUrl,\n    head_sha: headSha,\n    risk_level: riskLevel,\n    findings_count: highConfidenceFindings.length,\n    high_severity_count: highSeverityFindings.length,\n    summary: summary,\n    false_positive_risk: fpRisk,\n    should_escalate: shouldEscalate,\n    should_comment: shouldComment,\n    comment_body: commentBody,\n    parse_error: parseError,\n    parse_failed: false\n  }\n}];"
+      },
+      "output_shape": {
+        "repo_full_name": "string",
+        "pr_number": "number",
+        "pr_title": "string",
+        "pr_html_url": "string",
+        "head_sha": "string",
+        "risk_level": "string",
+        "findings_count": "number",
+        "high_severity_count": "number",
+        "summary": "string",
+        "false_positive_risk": "string",
+        "should_escalate": "boolean",
+        "should_comment": "boolean",
+        "comment_body": "string",
+        "parse_error": "string or null",
+        "parse_failed": "boolean"
+      },
+      "error_handling": "On code failure, set should_comment=false, should_escalate=false, and route to Slack alert"
+    },
+    {
+      "id": "step_7b",
+      "name": "Gate Parse Succeeded",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes to normal comment/escalation flow if parse succeeded; routes to Slack infrastructure error if parse_failed is true",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.parse_failed }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "false"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {},
+      "error_handling": "False branch routes to Slack infrastructure error alert"
+    },
+    {
+      "id": "step_8",
+      "name": "Check If Should Post Comment",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes to post GitHub comment if there are medium/high-confidence findings; routes to escalation check otherwise",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.should_comment }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {},
+      "error_handling": "False branch routes to escalation gate"
+    },
+    {
+      "id": "step_9",
+      "name": "Post Security Findings Comment to GitHub",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Posts the formatted security findings as a non-blocking pull request comment on GitHub via the issues comments API",
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $json.repo_full_name }}/issues/{{ $json.pr_number }}/comments",
+        "method": "POST",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "body": "={{ $json.comment_body }}"
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "body": {
+          "id": "comment id",
+          "html_url": "comment url"
+        }
+      },
+      "error_handling": "On failure after retries, send Slack error alert; do not crash workflow"
+    },
+    {
+      "id": "step_10",
+      "name": "Preserve Report Data After Comment Post",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Re-sets the report fields needed for the escalation gate, since the httpRequest node from step 9 overwrites $json with the GitHub API response. Includes summary and high_severity_count needed by the Slack alert in step_13.",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "repo_full_name",
+              "value": "={{ $('Parse LLM Security Report').first().json.repo_full_name }}",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "pr_number",
+              "value": "={{ $('Parse LLM Security Report').first().json.pr_number }}",
+              "type": "number"
+            },
+            {
+              "id": "a2",
+              "name": "pr_title",
+              "value": "={{ $('Parse LLM Security Report').first().json.pr_title }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "pr_html_url",
+              "value": "={{ $('Parse LLM Security Report').first().json.pr_html_url }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "head_sha",
+              "value": "={{ $('Parse LLM Security Report').first().json.head_sha }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "risk_level",
+              "value": "={{ $('Parse LLM Security Report').first().json.risk_level }}",
+              "type": "string"
+            },
+            {
+              "id": "a6",
+              "name": "findings_count",
+              "value": "={{ $('Parse LLM Security Report').first().json.findings_count }}",
+              "type": "number"
+            },
+            {
+              "id": "a7",
+              "name": "high_severity_count",
+              "value": "={{ $('Parse LLM Security Report').first().json.high_severity_count }}",
+              "type": "number"
+            },
+            {
+              "id": "a8",
+              "name": "summary",
+              "value": "={{ $('Parse LLM Security Report').first().json.summary }}",
+              "type": "string"
+            },
+            {
+              "id": "a9",
+              "name": "should_escalate",
+              "value": "={{ $('Parse LLM Security Report').first().json.should_escalate }}",
+              "type": "boolean"
+            },
+            {
+              "id": "a10",
+              "name": "comment_posted",
+              "value": true,
+              "type": "boolean"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "repo_full_name": "string",
+        "pr_number": "number",
+        "pr_title": "string",
+        "pr_html_url": "string",
+        "head_sha": "string",
+        "risk_level": "string",
+        "findings_count": "number",
+        "high_severity_count": "number",
+        "summary": "string",
+        "should_escalate": "boolean",
+        "comment_posted": "boolean"
+      },
+      "error_handling": "On failure, log and continue"
+    },
+    {
+      "id": "step_11",
+      "name": "Check If Should Escalate to Security Team",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes to request security team review if risk is high with high-severity findings; otherwise routes to final log step. Reads should_escalate from Parse LLM Security Report directly to ensure this field is always available regardless of which branch (comment posted or not) arrived here.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $('Parse LLM Security Report').first().json.should_escalate }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {},
+      "error_handling": "False branch routes to final logging step"
+    },
+    {
+      "id": "step_12",
+      "name": "Request Security Team Review on GitHub",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Requests the security team as reviewers on the GitHub pull request using the request reviewers API endpoint",
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $('Parse LLM Security Report').first().json.repo_full_name }}/pulls/{{ $('Parse LLM Security Report').first().json.pr_number }}/requested_reviewers",
+        "method": "POST",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "team_reviewers": [
+            "security-team"
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "body": {
+          "requested_reviewers": "array",
+          "requested_teams": "array"
+        }
+      },
+      "error_handling": "On failure after retries, send Slack alert; do not crash workflow"
+    },
+    {
+      "id": "step_13",
+      "name": "Send High Risk Alert to Slack Security Channel",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Sends a structured Slack alert to the security team channel with PR details, risk level, and a direct link to the pull request. Always reads from Parse LLM Security Report named node to ensure data is available regardless of which path led here.",
+      "parameters": {
+        "url": "https://internal.example/slack/sec-alerts",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "text": "=:rotating_light: *High-Risk PR Detected \u2014 Security Review Requested*\n\n*PR:* <{{ $('Parse LLM Security Report').first().json.pr_html_url }}|{{ $('Parse LLM Security Report').first().json.pr_title }}>\n*Repo:* {{ $('Parse LLM Security Report').first().json.repo_full_name }}\n*PR #:* {{ $('Parse LLM Security Report').first().json.pr_number }}\n*Risk Level:* {{ $('Parse LLM Security Report').first().json.risk_level.toUpperCase() }}\n*High-Severity Findings:* {{ $('Parse LLM Security Report').first().json.high_severity_count }}\n*Summary:* {{ $('Parse LLM Security Report').first().json.summary }}\n\nSecurity team has been added as reviewers. Please review before merge."
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 2,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "body": "Slack API response"
+      },
+      "error_handling": "On failure, log internally \u2014 do not re-alert"
+    },
+    {
+      "id": "step_14",
+      "name": "Log Scan Completion",
+      "node_type": "n8n-nodes-base.set",
+      "determinism": "1.0",
+      "description": "Records final scan outcome for internal audit log including PR details, risk level, findings count, actions taken, and timestamp",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "log_event",
+              "value": "pr_security_scan_complete",
+              "type": "string"
+            },
+            {
+              "id": "a1",
+              "name": "timestamp",
+              "value": "={{ new Date().toISOString() }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "repo_full_name",
+              "value": "={{ $('Parse LLM Security Report').first().json.repo_full_name }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "pr_number",
+              "value": "={{ $('Parse LLM Security Report').first().json.pr_number }}",
+              "type": "number"
+            },
+            {
+              "id": "a4",
+              "name": "risk_level",
+              "value": "={{ $('Parse LLM Security Report').first().json.risk_level }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "findings_count",
+              "value": "={{ $('Parse LLM Security Report').first().json.findings_count }}",
+              "type": "number"
+            },
+            {
+              "id": "a6",
+              "name": "escalated",
+              "value": "={{ $('Parse LLM Security Report').first().json.should_escalate }}",
+              "type": "boolean"
+            },
+            {
+              "id": "a7",
+              "name": "summary",
+              "value": "={{ $('Parse LLM Security Report').first().json.summary }}",
+              "type": "string"
+            },
+            {
+              "id": "a8",
+              "name": "scan_status",
+              "value": "success",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "log_event": "string",
+        "timestamp": "string",
+        "repo_full_name": "string",
+        "pr_number": "number",
+        "risk_level": "string",
+        "findings_count": "number",
+        "escalated": "boolean",
+        "scan_status": "string"
+      },
+      "error_handling": "Non-critical \u2014 log failure internally"
+    },
+    {
+      "id": "step_15",
+      "name": "Send Infrastructure Error Alert to Slack",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Sends a Slack alert to the security channel when infrastructure errors occur (GitHub API, LLM failures, or parse failures) so the platform team can investigate without posting confusing comments on the PR",
+      "parameters": {
+        "url": "https://internal.example/slack/sec-alerts",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "text": "=:warning: *PR Security Scanner \u2014 Infrastructure Error (Silent Failure)*\n\nThe security scanner encountered an error and could not complete analysis. No comment was posted on the PR.\n\n*Workflow:* GitHub PR Security Scanner\n*Time:* {{ new Date().toISOString() }}\n\nPlease check n8n execution logs for details."
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": false
+          }
+        }
+      },
+      "output_shape": {
+        "body": "Slack API response"
+      },
+      "error_handling": "Best-effort only \u2014 if this fails, log internally and exit"
+    }
+  ],
+  "gates": [
+    {
+      "after_step": "step_3",
+      "pass_to": "step_4",
+      "fail_to": "step_14",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_6c",
+      "pass_to": "step_7",
+      "fail_to": "step_15",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_7b",
+      "pass_to": "step_8",
+      "fail_to": "step_15",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_8",
+      "pass_to": "step_9",
+      "fail_to": "step_11",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_10",
+      "pass_to": "step_11",
+      "fail_to": "step_14",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_11",
+      "pass_to": "step_12",
+      "fail_to": "step_14",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_12",
+      "pass_to": "step_13",
+      "fail_to": "step_15",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_6",
+      "pass_to": "step_6b",
+      "fail_to": null,
+      "type": "sequential"
+    }
+  ],
+  "error_handling": {
+    "global_timeout_seconds": 60,
+    "on_workflow_failure": "Send Slack alert to sec-alerts webhook; never post confusing partial comments to GitHub; log execution ID and PR context for debugging"
+  },
+  "output": {
+    "destination": "GitHub PR comment (non-blocking) + optional security team reviewer request + Slack sec-alerts channel for escalations and errors",
+    "format": "GitHub Markdown comment with findings table; Slack plain-text alert for escalations; internal n8n execution log for all runs",
+    "description": "Security scan results are posted as informational GitHub comments. High-risk PRs trigger security team reviewer requests and Slack alerts. Infrastructure errors fail silently on GitHub (no comment posted) but alert via Slack."
+  },
+  "security": {
+    "credentials": [
+      "githubApi \u2014 GitHub Personal Access Token or GitHub App token with repo read and PR comment/reviewer write permissions",
+      "anthropicApi \u2014 Anthropic API key for Claude LLM access"
+    ],
+    "pii_handling": "PR diffs may contain code with PII or secrets. Diffs are sent to the LLM API and should be considered potentially sensitive. Do not log full diff text in n8n execution logs. LLM responses are ephemeral.",
+    "data_flow": "GitHub webhook \u2192 n8n (respondToWebhook 200 ACK immediately) \u2192 n8n (parse + validate) \u2192 GitHub API (fetch diff) \u2192 Anthropic API (analyze) \u2192 GitHub API (post comment + request reviewers) \u2192 Slack (escalation alert). No data is persisted in n8n beyond execution logs."
+  },
+  "cost_estimate": "1 LLM call per PR trigger. Using Claude 3.5 Haiku at ~$0.001/1K input tokens and ~$0.005/1K output tokens. Estimated 6000-9000 input tokens (diff + system prompt) + ~800 output tokens \u2248 $0.007\u2013$0.013 per PR scan. At 100 PRs/day: ~$0.70\u2013$1.30/day.",
+  "test_cases": [
+    {
+      "name": "Happy path - in-scope PR (acme/api)",
+      "input": {
+        "action": "opened",
+        "pull_request": {
+          "number": 42,
+          "url": "https://api.github.com/repos/acme/api/pulls/42",
+          "head": {
+            "sha": "abc123"
+          }
+        },
+        "repository": {
+          "full_name": "acme/api"
+        }
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "Out-of-scope repo - silently accepted",
+      "input": {
+        "action": "opened",
+        "pull_request": {
+          "number": 1,
+          "url": "https://api.github.com/repos/acme/marketing/pulls/1",
+          "head": {
+            "sha": "def456"
+          }
+        },
+        "repository": {
+          "full_name": "acme/marketing"
+        }
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "Synchronize event - new push to existing PR",
+      "input": {
+        "action": "synchronize",
+        "pull_request": {
+          "number": 99,
+          "url": "https://api.github.com/repos/acme/web/pulls/99",
+          "head": {
+            "sha": "deadbeef"
+          }
+        },
+        "repository": {
+          "full_name": "acme/web"
+        }
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "Closed action - silently ignored",
+      "input": {
+        "action": "closed",
+        "pull_request": {
+          "number": 7,
+          "url": "https://api.github.com/repos/acme/infra/pulls/7",
+          "head": {
+            "sha": "feed000"
+          }
+        },
+        "repository": {
+          "full_name": "acme/infra"
+        }
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "accepted"
+      }
+    },
+    {
+      "name": "Malformed payload - missing pull_request still 200",
+      "input": {
+        "action": "opened",
+        "repository": {
+          "full_name": "acme/api"
+        }
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "accepted"
+      }
+    }
+  ],
+  "components_used": [],
+  "components_needed": []
+}

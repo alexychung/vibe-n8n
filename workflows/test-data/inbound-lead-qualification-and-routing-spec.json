@@ -1,0 +1,870 @@
+{
+  "workflow_name": "Inbound Lead Qualification and Routing",
+  "description": "Qualifies inbound sales leads via webhook, enriches with Clearbit company data, scores with LLM for problem-fit, routes tier-A/B/C leads to Slack/HubSpot/SendGrid, and responds with status and lead_id within 3 seconds.",
+  "trigger": {
+    "type": "webhook",
+    "path": "lead-qualification",
+    "method": "POST",
+    "description": "Receives inbound sales lead form submissions as JSON POST body"
+  },
+  "steps": [
+    {
+      "id": "step_1",
+      "name": "Extract and Validate Lead Fields",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Extracts and validates required fields (name, email, company, role, problem_description) from webhook body. The POSTed JSON is under $json.body in n8n webhook triggers. Sets a valid flag and lead_id.",
+      "parameters": {
+        "jsCode": "const body = $json.body || {};\nconst email = (body.email || '').trim();\nconst name = (body.name || '').trim();\nconst company = (body.company || '').trim();\nconst role = (body.role || '').trim();\nconst problem_description = (body.problem_description || '').trim();\nconst phone = (body.phone || '').trim();\nconst lead_id = 'lead_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);\nconst valid = !!(email && name && company && problem_description);\nreturn [{ json: { valid, lead_id, email, name, company, role, phone, problem_description } }];"
+      },
+      "output_shape": {
+        "valid": "boolean",
+        "lead_id": "string",
+        "email": "string",
+        "name": "string",
+        "company": "string",
+        "role": "string",
+        "phone": "string",
+        "problem_description": "string"
+      },
+      "error_handling": "On code error, respond with 400 and error message"
+    },
+    {
+      "id": "step_2",
+      "name": "Gate: Validate Required Fields Present",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Passes if all required lead fields are valid; fails to 400 response.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.valid }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch": "true or false"
+      },
+      "error_handling": "Route false branch to 400 error response"
+    },
+    {
+      "id": "step_3",
+      "name": "Respond 400 Invalid Payload",
+      "node_type": "n8n-nodes-base.respondToWebhook",
+      "determinism": "1.0",
+      "description": "Sends a 400 error response for missing required fields back to the caller.",
+      "parameters": {
+        "responseCode": 400,
+        "responseBody": "{\"status\":\"error\",\"message\":\"Missing required fields: name, email, company, or problem_description\"}",
+        "responseHeaders": {
+          "entries": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "output_shape": {},
+      "error_handling": "Terminal node for invalid payload path"
+    },
+    {
+      "id": "step_4_respond_early",
+      "name": "Respond 200 Accepted Immediately",
+      "node_type": "n8n-nodes-base.respondToWebhook",
+      "determinism": "1.0",
+      "description": "Immediately responds to the webhook caller with 200 and the lead_id after validation passes, satisfying the <3s SLA. Processing continues asynchronously.",
+      "parameters": {
+        "responseCode": 200,
+        "responseBody": "={{ JSON.stringify({ status: 'success', lead_id: $json.lead_id, message: 'Lead received and is being processed.' }) }}",
+        "responseHeaders": {
+          "entries": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "output_shape": {
+        "lead_id": "string"
+      },
+      "error_handling": "On failure, log and continue processing"
+    },
+    {
+      "id": "step_5",
+      "name": "Enrich Company Data via Clearbit",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Calls Clearbit Company Enrichment API using the lead's email domain. Continue on fail is enabled so enrichment failures are handled gracefully. Note: Clearbit 404 returns {error: 'Not Found'} and 202 async responses return a body without metrics \u2014 both are treated as enrichment failures in step_6 and defaults are used.",
+      "parameters": {
+        "url": "={{ 'https://company.clearbit.com/v2/companies/find?domain=' + $json.email.split('@')[1] }}",
+        "method": "GET",
+        "options": {
+          "continueOnFail": true,
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "name": "string",
+        "domain": "string",
+        "metrics": {
+          "employees": "number",
+          "estimatedAnnualRevenue": "string"
+        },
+        "category": {
+          "industry": "string"
+        },
+        "tags": "array"
+      },
+      "error_handling": "Continue on fail; step_6_check_clearbit detects failure and sets clearbit_failed=true with empty enrichment defaults"
+    },
+    {
+      "id": "step_6_check_clearbit",
+      "name": "Check Clearbit Response and Set Enrichment",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Checks if Clearbit returned a valid response or failed. Merges enrichment data with original lead fields retrieved from the named upstream node. Sets clearbit_failed=true with defaults on failure. Both 404 ({error: 'Not Found'}) and 202 async (missing metrics) responses are treated as failures.",
+      "parameters": {
+        "jsCode": "const clearbitResp = $input.first().json;\nconst lead = $('Extract and Validate Lead Fields').first().json;\n\n// Detect Clearbit failure: error object, message field, or missing both metrics and domain\nconst clearbit_failed = !!(clearbitResp.error || clearbitResp.message || (!clearbitResp.metrics && !clearbitResp.domain));\n\nconst employees = (!clearbit_failed && clearbitResp.metrics && clearbitResp.metrics.employees) ? clearbitResp.metrics.employees : 0;\nconst industry = (!clearbit_failed && clearbitResp.category && clearbitResp.category.industry) ? clearbitResp.category.industry : 'Unknown';\nconst revenue = (!clearbit_failed && clearbitResp.metrics && clearbitResp.metrics.estimatedAnnualRevenue) ? clearbitResp.metrics.estimatedAnnualRevenue : 'Unknown';\n\nreturn [{ json: {\n  valid: lead.valid,\n  lead_id: lead.lead_id,\n  email: lead.email,\n  name: lead.name,\n  company: lead.company,\n  role: lead.role,\n  phone: lead.phone,\n  problem_description: lead.problem_description,\n  employees,\n  industry,\n  revenue,\n  clearbit_failed\n} }];"
+      },
+      "output_shape": {
+        "lead_id": "string",
+        "email": "string",
+        "name": "string",
+        "company": "string",
+        "role": "string",
+        "phone": "string",
+        "problem_description": "string",
+        "employees": "number",
+        "industry": "string",
+        "revenue": "string",
+        "clearbit_failed": "boolean"
+      },
+      "error_handling": "On code error, alert and abort workflow"
+    },
+    {
+      "id": "step_7",
+      "name": "Score Lead Problem-Fit via LLM",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "3.0",
+      "description": "Calls OpenAI Chat Completions API to score the lead's problem description for fit. Returns a JSON object with problem_fit_score (0-10) and fit_reasoning.",
+      "parameters": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "model": "gpt-4o-mini",
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a sales qualification assistant. Given a lead's problem description, company size, and industry, output ONLY a JSON object with two fields: problem_fit_score (integer 0-10, where 10 is perfect fit for a B2B SaaS sales automation product) and fit_reasoning (one sentence). Do not include any other text, markdown, or code fences."
+            },
+            {
+              "role": "user",
+              "content": "={{ 'Company: ' + $json.company + '\\nIndustry: ' + $json.industry + '\\nEmployees: ' + $json.employees + '\\nProblem: ' + $json.problem_description }}"
+            }
+          ],
+          "temperature": 0.2,
+          "max_tokens": 150
+        },
+        "options": {
+          "continueOnFail": true,
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 2,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "id": "string",
+        "choices": "array",
+        "usage": "object"
+      },
+      "error_handling": "Continue on fail; gate step_8 detects failure and routes to default score path"
+    },
+    {
+      "id": "step_8",
+      "name": "Gate: Validate LLM Response Received",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Checks that the LLM returned a valid choices array. Fails if response malformed or error.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ Array.isArray($json.choices) && $json.choices.length > 0 ? true : false }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch": "true or false"
+      },
+      "error_handling": "False branch triggers LLM failure alert and uses default score"
+    },
+    {
+      "id": "step_9",
+      "name": "Alert LLM Failure and Set Default Score",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Posts an alert to the internal Slack error channel when LLM scoring fails (no valid choices array returned).",
+      "parameters": {
+        "url": "https://internal.example/slack/post",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "channel": "#sales-alerts",
+          "text": "={{ ':rotating_light: LLM scoring failed for lead ' + $('Check Clearbit Response and Set Enrichment').first().json.lead_id + ' (' + $('Check Clearbit Response and Set Enrichment').first().json.email + '). Defaulting problem_fit_score to 5.' }}"
+        },
+        "options": {}
+      },
+      "output_shape": {
+        "ok": "boolean"
+      },
+      "error_handling": "Best-effort alert; continue regardless of result"
+    },
+    {
+      "id": "step_10",
+      "name": "Set Default Score After LLM Failure",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Spreads all lead fields from the enriched lead node and adds default problem_fit_score=5 and empty reasoning when LLM fails. Also computes tier and composite score so the output shape matches step_11.",
+      "parameters": {
+        "jsCode": "const lead = $('Check Clearbit Response and Set Enrichment').first().json;\n\nconst problem_fit_score = 5;\nconst fit_reasoning = 'LLM scoring unavailable; default score applied';\nconst llm_failed = true;\n\n// Size score\nconst employees = lead.employees || 0;\nlet size_score = 0;\nif (employees >= 500) size_score = 3;\nelse if (employees >= 50) size_score = 2;\nelse size_score = 1;\n\n// Industry score\nconst highValueIndustries = ['Technology', 'Software', 'Financial Services', 'Healthcare', 'E-commerce', 'SaaS'];\nconst medValueIndustries = ['Manufacturing', 'Retail', 'Education', 'Professional Services'];\nlet industry_score = 0;\nif (highValueIndustries.some(i => (lead.industry || '').includes(i))) industry_score = 3;\nelse if (medValueIndustries.some(i => (lead.industry || '').includes(i))) industry_score = 2;\nelse industry_score = 1;\n\nconst composite_score = (problem_fit_score * 0.5) + (size_score * 1.5) + (industry_score * 1.0);\n\nlet tier;\nif (composite_score >= 10) tier = 'A';\nelse if (composite_score >= 6) tier = 'B';\nelse tier = 'C';\n\nreturn [{ json: {\n  lead_id: lead.lead_id,\n  email: lead.email,\n  name: lead.name,\n  company: lead.company,\n  role: lead.role,\n  phone: lead.phone,\n  problem_description: lead.problem_description,\n  employees: lead.employees,\n  industry: lead.industry,\n  revenue: lead.revenue,\n  clearbit_failed: lead.clearbit_failed || false,\n  problem_fit_score,\n  fit_reasoning,\n  llm_failed,\n  size_score,\n  industry_score,\n  composite_score,\n  tier\n} }];"
+      },
+      "output_shape": {
+        "lead_id": "string",
+        "email": "string",
+        "name": "string",
+        "company": "string",
+        "role": "string",
+        "phone": "string",
+        "problem_description": "string",
+        "employees": "number",
+        "industry": "string",
+        "revenue": "string",
+        "clearbit_failed": "boolean",
+        "problem_fit_score": "number",
+        "fit_reasoning": "string",
+        "llm_failed": "boolean",
+        "size_score": "number",
+        "industry_score": "number",
+        "composite_score": "number",
+        "tier": "string"
+      },
+      "error_handling": "Terminal fallback; always succeeds"
+    },
+    {
+      "id": "step_11",
+      "name": "Parse LLM Score and Compute Lead Tier",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Parses the LLM JSON response to extract problem_fit_score. Strips markdown code fences before parsing. Retrieves enriched lead fields from the named enrichment node. Computes final lead tier (A/B/C) and composite score. Sets llm_parse_failed flag if JSON parse fails.",
+      "parameters": {
+        "jsCode": "const llmResp = $input.first().json;\nconst lead = $('Check Clearbit Response and Set Enrichment').first().json;\n\nlet problem_fit_score = 5;\nlet fit_reasoning = '';\nlet llm_failed = false;\nlet llm_parse_failed = false;\n\nif (llmResp.choices && llmResp.choices.length > 0) {\n  try {\n    // Strip markdown code fences that some models add despite instructions\n    const rawContent = llmResp.choices[0].message.content || '';\n    const content = rawContent.replace(/```json\\n?|```/g, '').trim();\n    const parsed = JSON.parse(content);\n    problem_fit_score = (parsed.problem_fit_score !== undefined) ? Number(parsed.problem_fit_score) : 5;\n    fit_reasoning = parsed.fit_reasoning || '';\n  } catch(e) {\n    problem_fit_score = 5;\n    fit_reasoning = 'Parse error; default applied';\n    llm_failed = true;\n    llm_parse_failed = true;\n  }\n}\n\n// Size score\nconst employees = lead.employees || 0;\nlet size_score = 0;\nif (employees >= 500) size_score = 3;\nelse if (employees >= 50) size_score = 2;\nelse size_score = 1;\n\n// Industry score\nconst highValueIndustries = ['Technology', 'Software', 'Financial Services', 'Healthcare', 'E-commerce', 'SaaS'];\nconst medValueIndustries = ['Manufacturing', 'Retail', 'Education', 'Professional Services'];\nlet industry_score = 0;\nif (highValueIndustries.some(i => (lead.industry || '').includes(i))) industry_score = 3;\nelse if (medValueIndustries.some(i => (lead.industry || '').includes(i))) industry_score = 2;\nelse industry_score = 1;\n\n// Composite\nconst composite = (problem_fit_score * 0.5) + (size_score * 1.5) + (industry_score * 1.0);\n\nlet tier;\nif (composite >= 10) tier = 'A';\nelse if (composite >= 6) tier = 'B';\nelse tier = 'C';\n\nreturn [{ json: {\n  lead_id: lead.lead_id,\n  email: lead.email,\n  name: lead.name,\n  company: lead.company,\n  role: lead.role,\n  phone: lead.phone,\n  problem_description: lead.problem_description,\n  employees: lead.employees,\n  industry: lead.industry,\n  revenue: lead.revenue,\n  clearbit_failed: lead.clearbit_failed || false,\n  problem_fit_score,\n  fit_reasoning,\n  llm_failed,\n  llm_parse_failed,\n  size_score,\n  industry_score,\n  composite_score: composite,\n  tier\n} }];"
+      },
+      "output_shape": {
+        "lead_id": "string",
+        "email": "string",
+        "name": "string",
+        "company": "string",
+        "role": "string",
+        "phone": "string",
+        "problem_description": "string",
+        "employees": "number",
+        "industry": "string",
+        "revenue": "string",
+        "clearbit_failed": "boolean",
+        "problem_fit_score": "number",
+        "fit_reasoning": "string",
+        "llm_failed": "boolean",
+        "llm_parse_failed": "boolean",
+        "size_score": "number",
+        "industry_score": "number",
+        "composite_score": "number",
+        "tier": "string (A, B, or C)"
+      },
+      "error_handling": "On code error, alert and abort"
+    },
+    {
+      "id": "step_13",
+      "name": "Route Tier A vs B/C",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes tier-A leads to hot Slack channel; tier-B/C continue to next branch. Receives input from whichever of step_11 or step_10 ran (both feed directly into this node).",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.tier }}",
+              "rightValue": "A",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch": "true (tier A) or false (tier B/C)"
+      },
+      "error_handling": "Default to false branch on error"
+    },
+    {
+      "id": "step_14",
+      "name": "Post Tier-A Lead to #sales-hot Slack",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Posts a hot lead alert to the #sales-hot Slack channel for tier-A leads.",
+      "parameters": {
+        "url": "https://internal.example/slack/post",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "channel": "#sales-hot",
+          "text": "={{ ':fire: *HOT LEAD [Tier A]* \u2014 ' + $json.name + ' (' + $json.email + ') from ' + $json.company + '\\nIndustry: ' + $json.industry + ' | Employees: ' + $json.employees + '\\nProblem: ' + $json.problem_description + '\\nFit Score: ' + $json.problem_fit_score + '/10 | Composite: ' + $json.composite_score + '\\nLead ID: ' + $json.lead_id }}"
+        },
+        "options": {
+          "continueOnFail": true,
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 500
+          }
+        }
+      },
+      "output_shape": {
+        "ok": "boolean"
+      },
+      "error_handling": "Continue on fail; proceed to HubSpot restore step"
+    },
+    {
+      "id": "step_15",
+      "name": "Route Tier B vs C",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Routes tier-B leads to SDR queue Slack channel; tier-C to nurture email path.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ $json.tier }}",
+              "rightValue": "B",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch": "true (tier B) or false (tier C)"
+      },
+      "error_handling": "Default to false branch on error"
+    },
+    {
+      "id": "step_16",
+      "name": "Post Tier-B Lead to #sales-queue Slack",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Posts a qualified lead to the #sales-queue Slack channel for SDR follow-up.",
+      "parameters": {
+        "url": "https://internal.example/slack/post",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "channel": "#sales-queue",
+          "text": "={{ ':telephone_receiver: *SDR QUEUE LEAD [Tier B]* \u2014 ' + $json.name + ' (' + $json.email + ') from ' + $json.company + '\\nIndustry: ' + $json.industry + ' | Employees: ' + $json.employees + '\\nProblem: ' + $json.problem_description + '\\nFit Score: ' + $json.problem_fit_score + '/10 | Composite: ' + $json.composite_score + '\\nLead ID: ' + $json.lead_id }}"
+        },
+        "options": {
+          "continueOnFail": true,
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 500
+          }
+        }
+      },
+      "output_shape": {
+        "ok": "boolean"
+      },
+      "error_handling": "Continue on fail; proceed to HubSpot restore step"
+    },
+    {
+      "id": "step_17",
+      "name": "Send Tier-C Nurture Email via SendGrid",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Sends a nurture email to tier-C leads via SendGrid transactional email API.",
+      "parameters": {
+        "url": "https://api.sendgrid.com/v3/mail/send",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "personalizations": [
+            {
+              "to": [
+                {
+                  "email": "={{ $json.email }}",
+                  "name": "={{ $json.name }}"
+                }
+              ],
+              "dynamic_template_data": {
+                "first_name": "={{ $json.name.split(' ')[0] }}",
+                "company": "={{ $json.company }}",
+                "lead_id": "={{ $json.lead_id }}"
+              }
+            }
+          ],
+          "from": {
+            "email": "sales@example.com",
+            "name": "Example Sales Team"
+          },
+          "template_id": "d-nurture-template-id-placeholder",
+          "subject": "={{ 'Thanks for reaching out, ' + $json.name.split(' ')[0] + '!' }}"
+        },
+        "options": {
+          "continueOnFail": true,
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "statusCode": "202"
+      },
+      "error_handling": "Continue on fail; proceed to HubSpot restore step"
+    },
+    {
+      "id": "step_19",
+      "name": "Restore Full Lead Fields for HubSpot",
+      "node_type": "n8n-nodes-base.code",
+      "determinism": "1.0",
+      "description": "Restores the full scored lead object from the named scoring step so HubSpot sync has all required fields. Uses try/catch to safely fall back from step_11 to step_10 in case the LLM failure path ran and step_11 was never executed.",
+      "parameters": {
+        "jsCode": "let lead;\ntry {\n  lead = $('Parse LLM Score and Compute Lead Tier').first().json;\n} catch(e) {\n  lead = $('Set Default Score After LLM Failure').first().json;\n}\nreturn [{ json: lead }];"
+      },
+      "output_shape": {
+        "lead_id": "string",
+        "email": "string",
+        "name": "string",
+        "company": "string",
+        "role": "string",
+        "phone": "string",
+        "problem_description": "string",
+        "employees": "number",
+        "industry": "string",
+        "revenue": "string",
+        "problem_fit_score": "number",
+        "fit_reasoning": "string",
+        "composite_score": "number",
+        "tier": "string"
+      },
+      "error_handling": "On code error, alert and abort"
+    },
+    {
+      "id": "step_20",
+      "name": "Sync Lead to HubSpot Contacts",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Creates or updates a HubSpot contact with all lead and scoring data using the upsert endpoint. NOTE: The following custom contact properties must be pre-created in HubSpot before deployment: lead_tier, lead_composite_score, lead_fit_score, lead_id, lead_problem_description, lead_fit_reasoning. Missing properties will cause a 400 error.",
+      "parameters": {
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/upsert",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "inputs": [
+            {
+              "idProperty": "email",
+              "properties": {
+                "email": "={{ $json.email }}",
+                "firstname": "={{ $json.name.split(' ')[0] }}",
+                "lastname": "={{ $json.name.split(' ').slice(1).join(' ') }}",
+                "company": "={{ $json.company }}",
+                "phone": "={{ $json.phone }}",
+                "jobtitle": "={{ $json.role }}",
+                "numemployees": "={{ $json.employees }}",
+                "industry": "={{ $json.industry }}",
+                "lead_tier": "={{ $json.tier }}",
+                "lead_composite_score": "={{ $json.composite_score }}",
+                "lead_fit_score": "={{ $json.problem_fit_score }}",
+                "lead_id": "={{ $json.lead_id }}",
+                "lead_problem_description": "={{ $json.problem_description }}",
+                "lead_fit_reasoning": "={{ $json.fit_reasoning }}"
+              }
+            }
+          ]
+        },
+        "options": {
+          "continueOnFail": true,
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "output_shape": {
+        "results": "array",
+        "status": "string"
+      },
+      "error_handling": "Continue on fail; gate step_21 checks for success and alerts on failure"
+    },
+    {
+      "id": "step_21",
+      "name": "Gate: Validate HubSpot Sync Success",
+      "node_type": "n8n-nodes-base.if",
+      "determinism": "1.0",
+      "description": "Checks if HubSpot sync returned a non-empty results array. Routes to alert on failure (false branch). True branch (success) is a terminal no-op \u2014 no node connected.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": ""
+          },
+          "conditions": [
+            {
+              "id": "cond_0",
+              "leftValue": "={{ Array.isArray($json.results) && $json.results.length > 0 ? true : false }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "output_shape": {
+        "branch": "true (success, terminal) or false (failure, alert)"
+      },
+      "error_handling": "False branch posts HubSpot failure alert; true branch terminates"
+    },
+    {
+      "id": "step_22",
+      "name": "Alert HubSpot Sync Failure",
+      "node_type": "n8n-nodes-base.httpRequest",
+      "determinism": "1.0",
+      "description": "Posts a HubSpot sync failure alert to #sales-alerts Slack channel. Only connected to the false (failure) branch of step_21. Includes HubSpot response details for debugging. Check that required custom HubSpot properties are created if this alert fires frequently.",
+      "parameters": {
+        "url": "https://internal.example/slack/post",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "channel": "#sales-alerts",
+          "text": "={{ ':warning: HubSpot sync FAILED for lead ' + $('Restore Full Lead Fields for HubSpot').first().json.lead_id + ' (' + $('Restore Full Lead Fields for HubSpot').first().json.email + '). Tier: ' + $('Restore Full Lead Fields for HubSpot').first().json.tier + '. Manual sync required. Ensure custom HubSpot properties (lead_tier, lead_composite_score, lead_fit_score, lead_id, lead_problem_description, lead_fit_reasoning) are created in HubSpot.' }}"
+        },
+        "options": {}
+      },
+      "output_shape": {
+        "ok": "boolean"
+      },
+      "error_handling": "Best-effort; always continue"
+    }
+  ],
+  "gates": [
+    {
+      "after_step": "step_2",
+      "pass_to": "step_4_respond_early",
+      "fail_to": "step_3",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_4_respond_early",
+      "next": "step_5",
+      "type": "sequential"
+    },
+    {
+      "after_step": "step_5",
+      "next": "step_6_check_clearbit",
+      "type": "sequential"
+    },
+    {
+      "after_step": "step_6_check_clearbit",
+      "next": "step_7",
+      "type": "sequential"
+    },
+    {
+      "after_step": "step_7",
+      "next": "step_8",
+      "type": "sequential"
+    },
+    {
+      "after_step": "step_8",
+      "pass_to": "step_11",
+      "fail_to": "step_9",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_9",
+      "next": "step_10",
+      "type": "sequential"
+    },
+    {
+      "after_step": "step_10",
+      "next": "step_13",
+      "type": "sequential",
+      "note": "LLM failure path feeds directly into tier routing, bypassing the removed merge node (step_12)"
+    },
+    {
+      "after_step": "step_11",
+      "next": "step_13",
+      "type": "sequential",
+      "note": "LLM success path feeds directly into tier routing, bypassing the removed merge node (step_12)"
+    },
+    {
+      "after_step": "step_13",
+      "pass_to": "step_14",
+      "fail_to": "step_15",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_15",
+      "pass_to": "step_16",
+      "fail_to": "step_17",
+      "type": "conditional_branch"
+    },
+    {
+      "after_step": "step_14",
+      "next": "step_19",
+      "type": "sequential",
+      "note": "Tier-A path feeds directly to restore step; removed problematic 3-input passThrough merge (step_18)"
+    },
+    {
+      "after_step": "step_16",
+      "next": "step_19",
+      "type": "sequential",
+      "note": "Tier-B path feeds directly to restore step; removed problematic 3-input passThrough merge (step_18)"
+    },
+    {
+      "after_step": "step_17",
+      "next": "step_19",
+      "type": "sequential",
+      "note": "Tier-C path feeds directly to restore step; removed problematic 3-input passThrough merge (step_18)"
+    },
+    {
+      "after_step": "step_19",
+      "next": "step_20",
+      "type": "sequential"
+    },
+    {
+      "after_step": "step_20",
+      "next": "step_21",
+      "type": "sequential"
+    },
+    {
+      "after_step": "step_21",
+      "pass_to": null,
+      "fail_to": "step_22",
+      "type": "conditional_branch",
+      "note": "True branch (HubSpot success) is terminal with no connection. Only false branch (failure) connects to step_22 alert."
+    }
+  ],
+  "error_handling": {
+    "global_timeout_seconds": 25,
+    "on_workflow_failure": "Post alert to #sales-alerts Slack channel with lead_id, error message, and stack trace. Webhook responds with 500 and error status."
+  },
+  "output": {
+    "destination": "Webhook HTTP response (sent immediately after validation via step_4_respond_early)",
+    "format": "JSON with status, lead_id, message",
+    "description": "All valid leads receive an immediate <3s webhook response after validation. Processing (enrichment, scoring, routing, HubSpot sync) continues asynchronously. Tier A: hot Slack + HubSpot. Tier B: queue Slack + HubSpot. Tier C: nurture email + HubSpot. Invalid leads receive 400 synchronously."
+  },
+  "security": {
+    "credentials": [
+      "Clearbit API key (HTTP header Authorization: Bearer)",
+      "OpenAI API key (HTTP header Authorization: Bearer)",
+      "HubSpot private app token (HTTP header Authorization: Bearer)",
+      "SendGrid API key (HTTP header Authorization: Bearer)",
+      "Internal Slack poster (no auth required per spec)"
+    ],
+    "pii_handling": "Lead PII (name, email, phone) is transmitted to Clearbit, OpenAI, HubSpot, and SendGrid. Ensure DPA agreements are in place. Do not log raw webhook bodies containing PII in n8n execution logs.",
+    "data_flow": "Webhook -> n8n -> [immediate 200 response] -> Clearbit (enrichment) -> OpenAI (scoring, sends problem_description) -> HubSpot (CRM sync) -> Slack (alert) / SendGrid (email)",
+    "hubspot_setup": "The following custom contact properties MUST be created in HubSpot before deploying this workflow: lead_tier (single-line text), lead_composite_score (number), lead_fit_score (number), lead_id (single-line text), lead_problem_description (multi-line text), lead_fit_reasoning (multi-line text). Missing properties will cause HubSpot upsert to return 400 errors and trigger the step_22 failure alert."
+  },
+  "cost_estimate": {
+    "per_run": "$0.002\u2013$0.010",
+    "breakdown": "OpenAI gpt-4o-mini ~150 tokens in + 150 tokens out \u2248 $0.0001; Clearbit Company lookup \u2248 $0.005\u2013$0.010 (depending on plan); HubSpot, SendGrid, Slack minimal/free tier costs",
+    "monthly_at_1000_leads": "$5\u2013$12 estimated"
+  },
+  "test_cases": [
+    {
+      "name": "Happy path \u2014 Tier A enterprise lead",
+      "input": {
+        "name": "Jane Smith",
+        "email": "jane.smith@bigcorp.com",
+        "company": "BigCorp Inc",
+        "role": "VP of Sales",
+        "phone": "+1-555-123-4567",
+        "problem_description": "We need to automate our outbound sales pipeline and SDR workflows at scale across 50 reps"
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "success",
+        "lead_id": "any non-empty string",
+        "message": "any non-empty string"
+      }
+    },
+    {
+      "name": "Happy path \u2014 Tier C small company low fit",
+      "input": {
+        "name": "Bob Lee",
+        "email": "bob@tinyshop.io",
+        "company": "Tiny Shop",
+        "role": "Owner",
+        "phone": "",
+        "problem_description": "I need a simple contact form for my website"
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "success",
+        "lead_id": "any non-empty string",
+        "message": "any non-empty string"
+      }
+    },
+    {
+      "name": "Missing required field \u2014 no email",
+      "input": {
+        "name": "Alice Johnson",
+        "email": "",
+        "company": "Acme Corp",
+        "role": "CTO",
+        "problem_description": "We want to streamline sales automation"
+      },
+      "expected": {
+        "http_status": 400,
+        "status": "error",
+        "message": "any non-empty string"
+      }
+    },
+    {
+      "name": "Missing required field \u2014 no problem description",
+      "input": {
+        "name": "Tom Brown",
+        "email": "tom@midmarket.com",
+        "company": "MidMarket Co",
+        "role": "Sales Director",
+        "problem_description": ""
+      },
+      "expected": {
+        "http_status": 400,
+        "status": "error",
+        "message": "any non-empty string"
+      }
+    },
+    {
+      "name": "Happy path \u2014 Tier B mid-size company",
+      "input": {
+        "name": "Maria Garcia",
+        "email": "maria@midtech.com",
+        "company": "MidTech Solutions",
+        "role": "Head of Revenue Ops",
+        "phone": "+1-555-987-6543",
+        "problem_description": "We are looking to improve our CRM data quality and lead scoring accuracy for our 100-person sales team"
+      },
+      "expected": {
+        "http_status": 200,
+        "status": "success",
+        "lead_id": "any non-empty string",
+        "message": "any non-empty string"
+      }
+    },
+    {
+      "name": "Missing required field \u2014 no name",
+      "input": {
+        "name": "",
+        "email": "unknown@corp.com",
+        "company": "Corp Inc",
+        "role": "Engineer",
+        "problem_description": "We need sales automation tooling"
+      },
+      "expected": {
+        "http_status": 400,
+        "status": "error",
+        "message": "any non-empty string"
+      }
+    },
+    {
+      "name": "Missing required field \u2014 no company",
+      "input": {
+        "name": "Sam Patel",
+        "email": "sam@somewhere.com",
+        "company": "",
+        "role": "Founder",
+        "problem_description": "Looking for outbound automation"
+      },
+      "expected": {
+        "http_status": 400,
+        "status": "error",
+        "message": "any non-empty string"
+      }
+    },
+    {
+      "name": "Completely empty body \u2014 all fields missing",
+      "input": {
+        "name": "",
+        "email": "",
+        "company": "",
+        "role": "",
+        "problem_description": ""
+      },
+      "expected": {
+        "http_status": 400,
+        "status": "error",
+        "message": "any non-empty string"
+      }
+    }
+  ],
+  "components_used": [],
+  "components_needed": []
+}
