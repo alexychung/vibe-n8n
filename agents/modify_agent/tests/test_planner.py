@@ -113,6 +113,38 @@ class TestValidateTacticalEdits(unittest.TestCase):
             validate_tactical_edits([edit], wf)
         self.assertIn('structural', str(cm.exception))
 
+    def test_set_node_parameter_refuses_to_change_id(self):
+        """REGRESSION: identity-bypass guard — set_node_parameter must not
+        be allowed to set path='id', path='type', etc. Without this guard,
+        a malicious or buggy edit could silently change a node's identity
+        and break execution history + connection references.
+        """
+        wf = make_workflow(nodes=[make_node('n1', 'Hook')])
+        for protected in ('id', 'type', 'typeVersion', 'webhookId', 'position', 'name'):
+            edit = Edit(type='set_node_parameter', node_id='n1',
+                        path=protected, new_value='hijacked')
+            with self.assertRaises(ModifyError) as cm:
+                validate_tactical_edits([edit], wf)
+            self.assertIn('protected', str(cm.exception), f'protected field: {protected}')
+
+    def test_set_node_setting_refuses_to_change_id(self):
+        """Same identity-bypass guard applies to set_node_setting."""
+        wf = make_workflow(nodes=[make_node('n1', 'Hook')])
+        edit = Edit(type='set_node_setting', node_id='n1',
+                    path='id', new_value='hijacked')
+        with self.assertRaises(ModifyError):
+            validate_tactical_edits([edit], wf)
+
+    def test_no_op_rename_rejected(self):
+        """rename_node where new_name == current name is a no-op — reject
+        rather than churn the connections object for nothing.
+        """
+        wf = make_workflow(nodes=[make_node('n1', 'Hook')])
+        edit = Edit(type='rename_node', node_id='n1', old_name='Hook', new_name='Hook')
+        with self.assertRaises(ModifyError) as cm:
+            validate_tactical_edits([edit], wf)
+        self.assertIn('no-op', str(cm.exception))
+
 
 if __name__ == '__main__':
     unittest.main()

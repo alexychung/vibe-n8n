@@ -131,5 +131,41 @@ class TestRollback(unittest.TestCase):
             self.assertEqual(os.path.getmtime(snap.path), mtime_before)
 
 
+class TestSnapshotIntegrity(unittest.TestCase):
+    """REGRESSION: load_snapshot used to raise FileNotFoundError /
+    JSONDecodeError raw, bypassing change_log persistence. A truncated or
+    tampered snapshot would PUT garbage and corrupt the live workflow.
+    Both paths now route through RollbackResult."""
+
+    def test_missing_snapshot_file_returns_clean_error(self):
+        client = MagicMock()
+        result = rollback(client, 'wf-test', '/nonexistent/path.json',
+                          snapshot_was_active=False)
+        self.assertFalse(result.restored)
+        self.assertIn('Cannot load snapshot', result.error)
+        client.update_workflow.assert_not_called()
+
+    def test_corrupt_snapshot_returns_clean_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad_path = os.path.join(d, 'bad.json')
+            with open(bad_path, 'w') as f:
+                f.write('{"this": "is missing nodes/connections/name"}')
+            client = MagicMock()
+            result = rollback(client, 'wf-test', bad_path, snapshot_was_active=False)
+            self.assertFalse(result.restored)
+            self.assertIn('missing required field', result.error)
+            client.update_workflow.assert_not_called()
+
+    def test_invalid_json_returns_clean_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad_path = os.path.join(d, 'bad.json')
+            with open(bad_path, 'w') as f:
+                f.write('not valid json at all')
+            client = MagicMock()
+            result = rollback(client, 'wf-test', bad_path, snapshot_was_active=False)
+            self.assertFalse(result.restored)
+            self.assertIn('Cannot load snapshot', result.error)
+
+
 if __name__ == '__main__':
     unittest.main()

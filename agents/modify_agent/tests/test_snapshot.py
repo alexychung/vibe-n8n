@@ -30,6 +30,17 @@ class TestSaveLoad(unittest.TestCase):
             snap = save_snapshot('wf-test', wf, target)
             self.assertTrue(os.path.exists(snap.path))
 
+    def test_back_to_back_snapshots_do_not_collide(self):
+        """REGRESSION: filenames previously used only second-precision
+        timestamps. Two modifies in the same second silently overwrote each
+        other's snapshot — losing the rollback target for the second one.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            wf = make_workflow()
+            paths = {save_snapshot('wf-test', wf, d).path for _ in range(20)}
+            # 20 saves in the same second should all produce distinct paths
+            self.assertEqual(len(paths), 20)
+
 
 class TestCleanup(unittest.TestCase):
 

@@ -72,6 +72,36 @@ class TestAuditDelta(unittest.TestCase):
         delta = audit_delta(snap, modified)
         self.assertEqual(delta.new_findings, [])
 
+    def test_rename_node_does_not_resurface_pre_existing_findings(self):
+        """REGRESSION: Without name_remap, a renamed node's pre-existing
+        findings get a new fingerprint and show up as NEW — causing HARDEN
+        to auto-modify pre-existing issues. The fix threads a {old: new}
+        rename map through audit_delta.
+        """
+        # Webhook node with no auth — flagged in BOTH snapshot and modified
+        snap = make_workflow(nodes=[
+            make_node('w1', 'Hook', type_='n8n-nodes-base.webhook',
+                      parameters={'path': 'foo'}),
+        ])
+        modified = make_workflow(nodes=[
+            make_node('w1', 'Hook V2', type_='n8n-nodes-base.webhook',  # renamed!
+                      parameters={'path': 'foo'}),
+        ])
+
+        # Without remap: the snapshot's finding fingerprints with 'Hook',
+        # the modified's with 'Hook V2' — they don't match, so the modified
+        # finding is incorrectly classified as NEW.
+        delta_no_remap = audit_delta(snap, modified)
+        self.assertGreaterEqual(delta_no_remap.new_warning, 1)
+
+        # With remap: snapshot's 'Hook' finding is rewritten to 'Hook V2'
+        # before fingerprinting → matches the modified finding → suppressed.
+        delta = audit_delta(snap, modified, name_remap={'Hook': 'Hook V2'})
+        self.assertEqual(delta.new_warning, 0)
+        self.assertTrue(any(
+            f.check == 'missing_webhook_auth' for f in delta.suppressed
+        ))
+
     def test_delta_counts_severities_correctly(self):
         # Add a node with a hardcoded credential to trigger a CRITICAL
         snap = make_workflow(nodes=[make_node('n1', 'X')])
