@@ -228,11 +228,17 @@ def _translate_if_params(spec_params: dict) -> dict:
 
 
 def _translate_respond_to_webhook_params(spec_params: dict) -> dict:
-    """Move top-level responseCode into options.responseCode.
+    """Move top-level responseCode into options.responseCode and default respondWith.
 
     n8n v1 respondToWebhook reads the status code from options.responseCode.
     PM-generated specs put it top-level; pass-through lets n8n silently fall
     back to 200 regardless of the emitted value.
+
+    Also defaults respondWith to 'json' when responseBody is set. Without
+    respondWith=='json', n8n ignores responseBody and returns the node's
+    input data verbatim — silently passing through whatever the upstream
+    node emitted (e.g. raw step_1 output instead of the configured
+    {"status":"success",...} envelope).
     """
     p = dict(spec_params)
     code = p.pop('responseCode', None)
@@ -240,6 +246,8 @@ def _translate_respond_to_webhook_params(spec_params: dict) -> dict:
         opts = dict(p.get('options') or {})
         opts.setdefault('responseCode', code)
         p['options'] = opts
+    if 'responseBody' in p and 'respondWith' not in p:
+        p['respondWith'] = 'json'
     return p
 
 
@@ -265,8 +273,19 @@ def _build_connections(spec: WorkflowSpec, nodes: list[dict]) -> dict:
     """
     connections = {}
 
-    # Find trigger node name
-    trigger_node = next(n for n in nodes if n['id'] == 'trigger')
+    # Empty step list: nothing to connect. parse_spec rejects this for normal
+    # builds, but wire() is also reachable from tests and the Modify Agent
+    # without going through parse_spec — be defensive.
+    if not spec.steps:
+        return connections
+
+    # Find trigger node name. Must exist with id='trigger' (set by scaffold).
+    trigger_node = next((n for n in nodes if n.get('id') == 'trigger'), None)
+    if trigger_node is None:
+        raise ValueError(
+            'No trigger node found (expected a node with id="trigger"). '
+            'wire() must be called on a workflow scaffolded by scaffold().'
+        )
     trigger_name = trigger_node['name']
 
     # Build step lookup: step_id → node_name
@@ -318,9 +337,13 @@ def _build_connections(spec: WorkflowSpec, nodes: list[dict]) -> dict:
                 'main': [[{'node': step_name[gate.pass_to], 'type': 'main', 'index': 0}]]
             }
         else:
-            node = _find_node_by_id(nodes, step.id)
-            if 'respondToWebhook' in (node.get('type') or ''):
-                continue  # terminal — never chain
+            # Linear-order fallback. respondToWebhook is normally terminal —
+            # but the "respond early, continue async" pattern places further
+            # steps after a 200-ack node. So we chain through respondToWebhook
+            # when the next non-gate-target step would otherwise be orphaned.
+            # If the spec puts only gate-target steps after a respondToWebhook
+            # (the typical "200 / 400 dead-ends" shape), nothing connects and
+            # it stays terminal naturally.
             for next_step in spec.steps[i + 1:]:
                 if next_step.id not in gate_targets:
                     connections[step_name[step.id]] = {

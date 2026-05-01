@@ -41,20 +41,30 @@ from status import BuildStatus
 
 
 def load_env():
-    """Load .env from project root if env vars not set."""
+    """Load .env from project root if env vars not set.
+
+    Walks up to find .env. Strips surrounding quotes from values
+    (`KEY="value"` → `value`). Tolerates `export KEY=value` and UTF-8 BOM.
+    Existing env vars take precedence (uses setdefault).
+    """
     if os.environ.get('N8N_API_KEY'):
         return
-    # Walk up to find .env
     d = os.path.dirname(__file__)
     for _ in range(5):
         env_path = os.path.join(d, '.env')
         if os.path.exists(env_path):
-            with open(env_path) as f:
+            with open(env_path, encoding='utf-8-sig') as f:
                 for line in f:
                     line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, val = line.split('=', 1)
-                        os.environ[key.strip()] = val.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    if line.startswith('export '):
+                        line = line[7:].lstrip()
+                    key, val = line.split('=', 1)
+                    val = val.strip()
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                        val = val[1:-1]
+                    os.environ.setdefault(key.strip(), val)
             return
         d = os.path.dirname(d)
 
@@ -218,10 +228,10 @@ def cmd_build(
 
         if generated_auth:
             auth_log_path = _write_auth_log(spec.workflow_name, generated_auth)
-            print('Webhook auth credentials created (save these — tokens are not recoverable):')
+            print(f'Webhook auth credentials created for {len(generated_auth)} node(s).')
             for a in generated_auth:
-                print(f'  - node "{a.node_name}": header {a.header_name}: {a.token}')
-            print(f'Tokens also written to {auth_log_path}')
+                print(f'  - node "{a.node_name}": header {a.header_name}')
+            print(f'Tokens written to {auth_log_path} (chmod 600). Inspect the file to retrieve them — they are not recoverable.')
             print()
 
         if unfixed_warnings:
@@ -380,6 +390,13 @@ def _write_auth_log(workflow_name: str, generated_auth: list, log_dir: str = 'bu
         lines.append('')
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
+    # Tighten permissions so the file isn't world-readable on multi-user
+    # systems. No-op on Windows (file ACLs ignore the chmod bits) but real
+    # protection on Linux/macOS where these tokens grant webhook access.
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
     return path
 
 
