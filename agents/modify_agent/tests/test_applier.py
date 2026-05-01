@@ -201,7 +201,10 @@ class TestApplyEditsIntegration(unittest.TestCase):
         ])
         client = MagicMock()
         client.deactivate_workflow.return_value = {}
-        client.get_workflow.return_value = live_wf
+        # The drift check now lives inside the update_workflow modifier so
+        # the GET-and-mutate happen on the same JSON the PUT will use. The
+        # mock invokes the modifier with the live (drifted) workflow.
+        client.update_workflow.side_effect = lambda wid, modifier: modifier(copy.deepcopy(live_wf))
 
         edits = [Edit(type='set_node_parameter', node_id='n1',
                       path='parameters.path', old_value='old', new_value='new')]
@@ -210,7 +213,6 @@ class TestApplyEditsIntegration(unittest.TestCase):
             apply_edits(client=client, workflow_id='wf-test',
                         edits=edits, snapshot_workflow=snap_wf, was_active=False)
         self.assertIn('externally', str(cm.exception))
-        client.update_workflow.assert_not_called()
 
 
 class TestSetPathErrors(unittest.TestCase):

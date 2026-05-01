@@ -36,7 +36,29 @@ def rollback(
     was taken — if so, we re-activate after restore.
     `reason`: surfaced in the result for the change log.
     """
-    snap = load_snapshot(snapshot_path)
+    try:
+        snap = load_snapshot(snapshot_path)
+    except (OSError, json.JSONDecodeError) as e:
+        return RollbackResult(
+            workflow_id=workflow_id,
+            snapshot_path=snapshot_path,
+            restored=False,
+            reactivated=False,
+            verification_passed=False,
+            error=f'Cannot load snapshot {snapshot_path}: {e}',
+        )
+    # Sanity check: a tampered/truncated snapshot would PUT garbage.
+    # Require the minimum fields we'll PUT back.
+    for field in ('name', 'nodes', 'connections'):
+        if field not in snap:
+            return RollbackResult(
+                workflow_id=workflow_id,
+                snapshot_path=snapshot_path,
+                restored=False,
+                reactivated=False,
+                verification_passed=False,
+                error=f'Snapshot at {snapshot_path} is missing required field {field!r} — cannot restore safely',
+            )
 
     # Always deactivate before PUT — n8n rejects updates to active workflows
     # in some configs, and deactivate is idempotent.

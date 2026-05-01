@@ -16,6 +16,15 @@ class PlanResult:
     summary: str  # one-line description of the planned change
 
 
+# Top-level node fields that establish identity — set_node_parameter and
+# set_node_setting must NOT be allowed to touch these. Identity preservation
+# is a spec invariant; the orchestrator and applier rely on these fields not
+# changing under their feet.
+_PROTECTED_NODE_FIELDS = frozenset({
+    'id', 'type', 'typeVersion', 'webhookId', 'position', 'name',
+})
+
+
 def validate_tactical_edits(edits: list[Edit], workflow: dict) -> PlanResult:
     """Validate each tactical edit against the live workflow.
 
@@ -44,6 +53,7 @@ def validate_tactical_edits(edits: list[Edit], workflow: dict) -> PlanResult:
 def _validate_one(edit: Edit, i: int, nodes_by_id: dict, workflow: dict, settings: dict):
     if edit.type == 'set_node_parameter':
         node = _require_node(edit, i, nodes_by_id)
+        _reject_identity_path(edit, i)
         actual = _get_path(node, edit.path)
         _check_old_value(edit, i, actual)
 
@@ -56,6 +66,10 @@ def _validate_one(edit: Edit, i: int, nodes_by_id: dict, workflow: dict, setting
                 f'edits[{i}]: old_name {edit.old_name!r} does not match '
                 f'live node name {node.get("name")!r}'
             )
+        if edit.new_name == node.get('name'):
+            raise ModifyError(
+                f'edits[{i}]: rename_node is a no-op (new_name == current name)'
+            )
         # Reject collisions
         for other in workflow.get('nodes', []):
             if other.get('id') != edit.node_id and other.get('name') == edit.new_name:
@@ -66,6 +80,7 @@ def _validate_one(edit: Edit, i: int, nodes_by_id: dict, workflow: dict, setting
 
     elif edit.type == 'set_node_setting':
         node = _require_node(edit, i, nodes_by_id)
+        _reject_identity_path(edit, i)
         # Settings live at the top level of the node (e.g. node['retryOnFail'])
         # OR nested in parameters.options for HTTP — accept whichever path.
         actual = _get_path(node, edit.path)
@@ -97,6 +112,26 @@ def _validate_one(edit: Edit, i: int, nodes_by_id: dict, workflow: dict, setting
 
     else:
         raise ModifyError(f'edits[{i}]: unknown tactical edit type {edit.type!r}')
+
+
+def _reject_identity_path(edit: Edit, i: int):
+    """Refuse edits whose first path segment is a node-identity field.
+
+    Without this, set_node_parameter with path='id' or path='type' would
+    silently change the node's identity — breaking execution history,
+    connection references, and the n8n editor's understanding of the node.
+    The classifier should never produce these, but a malicious or buggy
+    --edits file could.
+    """
+    if not edit.path:
+        raise ModifyError(f'edits[{i}]: {edit.type} requires path')
+    first = edit.path.split('.', 1)[0].split('[', 1)[0]
+    if first in _PROTECTED_NODE_FIELDS:
+        raise ModifyError(
+            f'edits[{i}]: refusing to set protected node field {first!r} via '
+            f'{edit.type} (use rename_node for name changes; identity fields '
+            f'cannot be changed)'
+        )
 
 
 def _require_node(edit: Edit, i: int, nodes_by_id: dict) -> dict:

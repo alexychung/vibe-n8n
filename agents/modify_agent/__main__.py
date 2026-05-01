@@ -57,17 +57,28 @@ def _project_root() -> str:
 
 
 def load_env():
-    """Load .env from project root if env vars not set."""
+    """Load .env from project root if env vars not set.
+
+    Strips surrounding quotes, tolerates `export KEY=value` and UTF-8 BOM.
+    Existing env vars take precedence (uses setdefault).
+    """
     if os.environ.get('N8N_API_KEY'):
         return
     env_path = os.path.join(_project_root(), '.env')
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, val = line.split('=', 1)
-                    os.environ[key.strip()] = val.strip()
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, encoding='utf-8-sig') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            if line.startswith('export '):
+                line = line[7:].lstrip()
+            key, val = line.split('=', 1)
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            os.environ.setdefault(key.strip(), val)
 
 
 def _snapshot_dir() -> str:
@@ -86,8 +97,11 @@ def _read_webhook_auth(workflow_name: str) -> dict:
     Only the first credential's header/token is used (the spec's first
     webhook trigger is what we'll be testing).
     """
-    import re
-    slug = re.sub(r'[^a-zA-Z0-9]+', '-', workflow_name).strip('-').lower() or 'workflow'
+    # Use build_agent.export._slugify so we look up the same filename the
+    # build agent wrote. A locally-rolled slugify could diverge on edge
+    # cases (em-dashes, accents) and silently fail to find the auth file.
+    from export import _slugify  # type: ignore[import-not-found]
+    slug = _slugify(workflow_name)
     path = os.path.join(_project_root(), 'build-logs', f'{slug}-auth.env')
     if not os.path.exists(path):
         return {}
@@ -264,6 +278,13 @@ def cmd_change(
     if spec is None:
         status.skip('TEST', 'no spec/test_cases available — modify deploys without re-test')
         test_results['skipped'] = True
+    elif not state.is_active:
+        # test_runner activates the workflow to send webhooks. We refuse to
+        # do that for an originally-inactive workflow — production traffic
+        # could hit it during the test window. The user explicitly chose to
+        # leave it inactive; we leave it that way.
+        status.skip('TEST', 'workflow inactive — skipping automated re-test (verify manually)')
+        test_results['skipped'] = True
     else:
         try:
             results = run_tests(spec, client, workflow_id, extra_headers=webhook_headers or None)
@@ -295,8 +316,24 @@ def cmd_change(
     _print_status(status)
 
     # ---- Phase 7: AUDIT (delta) ----
-    modified_wf = client.get_workflow(workflow_id)
-    delta = audit_delta(state.workflow, modified_wf)
+    try:
+        modified_wf = client.get_workflow(workflow_id)
+    except N8nApiError as e:
+        status.fail('AUDIT', f'failed to fetch modified workflow: {e}')
+        _print_status(status)
+        _do_rollback(client, status, workflow_id, snap.path, state.is_active, str(e))
+        _write_log(modify_id, started_at, state, change_description, classification,
+                   plan.edits, snap.path, test_results,
+                   {'new_critical': 0, 'new_warning': 0, 'new_info': 0},
+                   'rolled_back_in_audit', rollback_reason=str(e))
+        return 1
+    # Pre-existing per-node findings get re-fingerprinted to use the post-
+    # rename names; otherwise rename_node would resurface every finding on
+    # the renamed node as NEW and HARDEN would auto-modify pre-existing
+    # issues (e.g. add retry to an HTTP node that already had a missing_retry
+    # warning). See specs/modify-agent-spec.md identity preservation.
+    rename_remap = {e.old_name: e.new_name for e in plan.edits if e.type == 'rename_node'}
+    delta = audit_delta(state.workflow, modified_wf, name_remap=rename_remap)
     audit_results = {
         'new_critical': delta.new_critical,
         'new_warning': delta.new_warning,
@@ -319,7 +356,7 @@ def cmd_change(
             os.environ.pop('MODIFY_MODE', None)
         # Re-audit-delta after harden
         modified_wf = client.get_workflow(workflow_id)
-        post = audit_delta(state.workflow, modified_wf)
+        post = audit_delta(state.workflow, modified_wf, name_remap=rename_remap)
         if post.new_critical or post.new_warning:
             status.fail('HARDEN', f'{post.new_critical} critical / {post.new_warning} warning remain')
             _print_status(status)
@@ -380,7 +417,11 @@ def cmd_change(
 def _smoke_test(client: N8nClient, spec, webhook_headers: dict | None = None) -> str:
     """Send the first happy-path test through the production webhook.
 
-    Returns 'passed' | 'failed' | 'skipped'.
+    Returns 'passed' | 'failed' | 'skipped'. Pass criteria:
+      - HTTP status < 400 (200/204/3xx — anything in the 4xx/5xx range is fail)
+      - Response is a dict (n8n's responseToWebhook always returns one)
+      - At least one expected key is present in the response (proves the
+        webhook reached the right workflow and ran far enough to set fields)
     """
     if spec is None or not spec.test_cases or not spec.trigger.path:
         return 'skipped (no spec or no webhook)'
@@ -395,11 +436,19 @@ def _smoke_test(client: N8nClient, spec, webhook_headers: dict | None = None) ->
             actual = client.send_webhook(spec.trigger.path, tc.input, headers=webhook_headers or None)
     except Exception:
         return 'failed'
-    # We don't strictly compare — production webhook returning a dict response
-    # at all is a success signal that routing works end-to-end.
-    if isinstance(actual, dict) and actual.get('http_status', 0) < 500:
-        return 'passed'
-    return 'failed'
+
+    if not isinstance(actual, dict):
+        return 'failed'
+    if actual.get('http_status', 0) >= 400:
+        return 'failed'
+    # Don't full-match (smoke test, not regression test) but require AT LEAST
+    # one expected key — guards against routing a webhook to a different live
+    # workflow that returns 200 with a totally different body.
+    expected = tc.expected if isinstance(tc.expected, dict) else {}
+    expected_keys = [k for k in expected if k != 'http_status']
+    if expected_keys and not any(k in actual for k in expected_keys):
+        return 'failed'
+    return 'passed'
 
 
 def _load_spec_for_tests(state):

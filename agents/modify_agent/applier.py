@@ -45,28 +45,24 @@ def apply_edits(
         except Exception as e:
             raise ModifyError(f'Failed to deactivate workflow before APPLY: {e}') from e
 
-    # UI-drift guard: re-fetch and compare structurally to the snapshot.
-    # We compare nodes/connections/settings, not the whole object — n8n
-    # adds fields like `updatedAt` that change on every read.
-    current = client.get_workflow(workflow_id)
-    if not _matches_snapshot(current, snapshot_workflow):
-        raise ModifyError(
-            'Workflow was edited externally between FETCH and APPLY '
-            '(nodes/connections/settings differ from snapshot). Re-run the modify.'
-        )
+    # UI-drift guard + edit application both happen INSIDE the modifier so
+    # they operate on the same GET that update_workflow's PUT will use. If
+    # we did the drift check on a separate earlier GET, a UI edit between
+    # the two GETs would silently get overwritten — exactly the corruption
+    # the drift guard exists to prevent.
+    def _modify(latest: dict) -> dict:
+        if not _matches_snapshot(latest, snapshot_workflow):
+            raise ModifyError(
+                'Workflow was edited externally between FETCH and APPLY '
+                '(nodes/connections/settings differ from snapshot). '
+                'Re-run the modify.'
+            )
+        result = copy.deepcopy(latest)
+        for edit in edits:
+            _apply_one(result, edit)
+        return result
 
-    # Apply each edit to a copy. Tactical edits don't depend on ordering
-    # within themselves, but we apply in user-given order so the change log
-    # stays readable.
-    modified = copy.deepcopy(current)
-    for edit in edits:
-        _apply_one(modified, edit)
-
-    # PUT via update_workflow's GET-modify-PUT — but we already have the
-    # canonical form so we just return our modified copy from the modifier.
-    def _replace(_wf):
-        return modified
-    final = client.update_workflow(workflow_id, _replace)
+    final = client.update_workflow(workflow_id, _modify)
 
     return ApplyResult(
         workflow_id=workflow_id,

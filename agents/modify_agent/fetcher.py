@@ -86,10 +86,18 @@ def fetch_state(client: N8nClient, workflow_id: str, spec_dir: str = '') -> Fetc
 
 
 def _slugify(name: str) -> str:
-    """Match build_agent.export._slugify behavior — lowercase, alphanum + hyphens."""
-    import re
-    s = re.sub(r'[^a-zA-Z0-9]+', '-', name).strip('-').lower()
-    return s or 'workflow'
+    """Delegate to build_agent.export._slugify so spec lookup uses the same
+    slug build agent wrote. Falls back to a local implementation if the
+    build_agent isn't on the path (shouldn't happen in normal use).
+    """
+    try:
+        from export import _slugify as _build_slugify  # type: ignore[import-not-found]
+        return _build_slugify(name)
+    except ImportError:
+        import re
+        s = name.lower().strip()
+        s = re.sub(r'[^a-z0-9]+', '-', s).strip('-')
+        return s or 'workflow'
 
 
 def _find_spec_file(spec_dir: str, workflow_name: str, workflow_id: str) -> tuple[Optional[dict], str]:

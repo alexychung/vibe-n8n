@@ -58,10 +58,22 @@ def now_iso() -> str:
 
 
 def write_change_log(entry: ChangeLogEntry, log_dir: str) -> str:
-    """Write a change log entry as JSON. Returns the path written."""
+    """Write a change log entry as JSON. Returns the path written.
+
+    Filename matches snapshot format (`{workflow_id}-{YYYYMMDD-HHMMSS}-{4hex}.json`)
+    so rapid back-to-back modifies don't overwrite each other and so
+    snapshot/change-log pairs can be matched by timestamp + modify_id.
+    """
     os.makedirs(log_dir, exist_ok=True)
-    ts = entry.started_at.replace(':', '').replace('-', '')[:15]
-    path = os.path.join(log_dir, f'{entry.workflow_id}-{ts}.json')
+    # Convert ISO 'YYYY-MM-DDTHH:MM:SS.ffffff+00:00' to '20260501-143022'.
+    iso = entry.started_at
+    date_part = iso[:10].replace('-', '')
+    time_part = iso[11:19].replace(':', '')
+    ts = f'{date_part}-{time_part}'
+    # 4-char suffix from modify_id (already random hex) keeps pairs traceable
+    # to a specific modify run.
+    suffix = entry.modify_id[:4] if entry.modify_id else 'xxxx'
+    path = os.path.join(log_dir, f'{entry.workflow_id}-{ts}-{suffix}.json')
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(entry.to_dict(), f, indent=2, ensure_ascii=False)
     return path

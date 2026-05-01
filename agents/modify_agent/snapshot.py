@@ -7,6 +7,7 @@ age out >90 days. Cheap (os.stat + delete) so it doesn't slow modifies.
 import datetime
 import json
 import os
+import uuid
 from dataclasses import dataclass
 
 
@@ -33,8 +34,11 @@ def save_snapshot(
     """
     os.makedirs(snapshot_dir, exist_ok=True)
     now = datetime.datetime.now(datetime.timezone.utc)
+    # Second-precision timestamp + 4-char hex suffix avoids collisions when
+    # two modifies fire in the same second (rapid retry, scripted runs).
     ts = now.strftime('%Y%m%d-%H%M%S')
-    path = os.path.join(snapshot_dir, f'{workflow_id}-{ts}.json')
+    suffix = uuid.uuid4().hex[:4]
+    path = os.path.join(snapshot_dir, f'{workflow_id}-{ts}-{suffix}.json')
 
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(workflow, f, indent=2, ensure_ascii=False)

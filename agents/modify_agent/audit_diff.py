@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from auditor import Finding, audit_workflow
+from auditor import Finding, audit_workflow  # noqa: F401
 
 
 _NODE_NAME_RE = re.compile(r'^Node\s+"([^"]+)":')
@@ -54,18 +54,38 @@ class AuditDelta:
         return sum(1 for f in self.new_findings if f.severity == 'INFO')
 
 
-def audit_delta(snapshot_workflow: dict, modified_workflow: dict) -> AuditDelta:
+def audit_delta(
+    snapshot_workflow: dict,
+    modified_workflow: dict,
+    name_remap: Optional[dict] = None,
+) -> AuditDelta:
     """Run audit on both workflows and return only the delta.
 
     A finding present in both is suppressed (not the modify's job).
     A finding present only in modified is new.
+
+    `name_remap`: {old_node_name: new_node_name} for any rename_node edits in
+    this modify. The snapshot's per-node findings are re-fingerprinted to use
+    the new names before comparison — without this, every pre-existing finding
+    on a renamed node would shift fingerprint and surface as NEW, causing
+    HARDEN to auto-modify pre-existing issues we promised to leave alone.
     """
     snap_findings = audit_workflow(snapshot_workflow)
     mod_findings = audit_workflow(modified_workflow)
 
-    snap_fps = {_fingerprint(f) for f in snap_findings}
+    snap_fps = {_fingerprint_with_remap(f, name_remap) for f in snap_findings}
 
     new = [f for f in mod_findings if _fingerprint(f) not in snap_fps]
     suppressed = [f for f in mod_findings if _fingerprint(f) in snap_fps]
 
     return AuditDelta(new_findings=new, suppressed=suppressed)
+
+
+def _fingerprint_with_remap(f: Finding, remap: Optional[dict]) -> tuple:
+    """Fingerprint a snapshot finding with node names rewritten to post-modify names."""
+    if not remap:
+        return _fingerprint(f)
+    name = _extract_node_name(f.message)
+    if name is None:
+        return (f.severity, f.check)
+    return (f.severity, f.check, remap.get(name, name))
