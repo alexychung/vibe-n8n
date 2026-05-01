@@ -5,6 +5,7 @@ Loops: audit → fix → re-audit until no CRITICALs/WARNINGs remain (max 3 iter
 Returns a HardenResult with the final findings plus any auth credentials created
 during the run (so callers can thread the token into smoke tests and export docs).
 """
+import os
 import secrets
 from dataclasses import dataclass, field
 
@@ -36,12 +37,21 @@ def harden(
     workflow_id: str,
     max_iterations: int = 3,
     workflow_name: str = '',
+    disable_credential_creation: bool = False,
 ) -> HardenResult:
     """Fix audit findings in a loop. Returns HardenResult.
 
     Each iteration: audit → (create credentials for webhook auth) → apply fixes → re-audit.
     Stops when no CRITICAL or WARNING findings remain, or max iterations reached.
+
+    `disable_credential_creation`: when True (or env MODIFY_MODE=1), skip the
+    webhook-auth credential-creation path — leave `missing_webhook_auth`
+    findings in place rather than rotating credentials. The Modify Agent sets
+    this so it can't silently rotate tokens out from under live callers.
     """
+    if not disable_credential_creation:
+        disable_credential_creation = os.environ.get('MODIFY_MODE') == '1'
+
     generated_auth: list[GeneratedAuth] = []
 
     for iteration in range(max_iterations):
@@ -55,13 +65,28 @@ def harden(
         # Pre-fix side effects: create header-auth credentials for every
         # webhook node flagged with missing_webhook_auth. Done before the
         # in-place patch so the credential IDs can be wired into node params.
-        name_hint = workflow_name or wf.get('name', 'workflow')
-        auth_assignments = _create_webhook_auth_credentials(client, wf, actionable, name_hint)
+        # Skipped in modify mode to preserve existing webhook auth contracts.
+        if disable_credential_creation:
+            auth_assignments: list[GeneratedAuth] = []
+        else:
+            name_hint = workflow_name or wf.get('name', 'workflow')
+            auth_assignments = _create_webhook_auth_credentials(client, wf, actionable, name_hint)
         generated_auth.extend(auth_assignments)
 
         auth_by_node = {a.node_name: a for a in auth_assignments}
 
-        def apply_fixes(wf: dict, _findings=actionable, _auth=auth_by_node) -> dict:
+        # In modify mode, drop missing_webhook_auth from the fix list so we
+        # don't half-attach credentials. The finding stays in the final result.
+        if disable_credential_creation:
+            fixable = [f for f in actionable if f.check != 'missing_webhook_auth']
+        else:
+            fixable = actionable
+
+        if not fixable:
+            # Nothing left to fix this iteration; re-audit would loop forever.
+            return HardenResult(findings=findings, generated_auth=generated_auth)
+
+        def apply_fixes(wf: dict, _findings=fixable, _auth=auth_by_node) -> dict:
             for finding in _findings:
                 _apply_fix(wf, finding, _auth)
             return wf

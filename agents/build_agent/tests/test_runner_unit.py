@@ -190,7 +190,7 @@ class TestRunTests(unittest.TestCase):
 
         run_tests(spec, client, 'wf-1')
 
-        client.send_webhook.assert_called_once_with('test-hook', {'key': 'val'})
+        client.send_webhook.assert_called_once_with('test-hook', {'key': 'val'}, headers=None)
 
     def test_get_trigger_sends_query_not_body(self):
         """GET trigger: inputs must go on the URL as query params; send_webhook
@@ -207,7 +207,7 @@ class TestRunTests(unittest.TestCase):
         run_tests(spec, client, 'wf-1')
 
         client.send_webhook.assert_called_once_with(
-            'test-hook', method='GET', query={'name': 'Alice', 'hour': 9}
+            'test-hook', method='GET', query={'name': 'Alice', 'hour': 9}, headers=None
         )
 
     def test_get_trigger_strips_query_wrapper(self):
@@ -226,7 +226,7 @@ class TestRunTests(unittest.TestCase):
         run_tests(spec, client, 'wf-1')
 
         client.send_webhook.assert_called_once_with(
-            'test-hook', method='GET', query={'name': 'Bob', 'hour': 14}
+            'test-hook', method='GET', query={'name': 'Bob', 'hour': 14}, headers=None
         )
 
 
